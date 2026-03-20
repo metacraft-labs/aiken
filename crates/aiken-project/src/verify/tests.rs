@@ -1,6 +1,11 @@
 use super::*;
+use crate::blueprint::{
+    definitions::{Definitions, Reference},
+    schema::{Annotated, Constructor, Data, Declaration, Items, Schema},
+};
 use crate::export::{
-    ExportedProgram, ExportedPropertyTest, FuzzerConstraint, FuzzerOutputType, TestReturnMode,
+    ExportedDataSchema, ExportedProgram, ExportedPropertyTest, FuzzerConstraint, FuzzerOutputType,
+    FuzzerSemantics, StateMachineAcceptance, StateMachineTransitionSemantics, TestReturnMode,
     ValidatorTarget,
 };
 use crate::{Project, options::Options, telemetry::EventTarget};
@@ -16,6 +21,14 @@ fn make_test_with_failure(
     on_test_failure: OnTestFailure,
 ) -> ExportedPropertyTest {
     let module_path = module.replace('.', "/");
+    let fuzzer_output_type = FuzzerOutputType::Int;
+    let constraint = FuzzerConstraint::IntRange {
+        min: "0".to_string(),
+        max: "255".to_string(),
+    };
+    let semantics =
+        derive_fixture_semantics_from_constraint(&fuzzer_output_type, &constraint, false);
+
     ExportedPropertyTest {
         name: format!("{module}.{name}"),
         module: module.to_string(),
@@ -33,11 +46,564 @@ fn make_test_with_failure(
             flat_bytes: None,
         },
         fuzzer_type: "Fuzzer<Int>".to_string(),
-        fuzzer_output_type: FuzzerOutputType::Int,
-        constraint: FuzzerConstraint::IntRange {
-            min: "0".to_string(),
-            max: "255".to_string(),
+        fuzzer_output_type,
+        constraint,
+        semantics,
+        fuzzer_data_schema: None,
+    }
+}
+
+fn generate_proof_file_with_force_sampled_fallback(
+    test: &ExportedPropertyTest,
+    test_id: &str,
+    lean_test_name: &str,
+    lean_module: &str,
+    existential_mode: ExistentialMode,
+    target: &VerificationTargetKind,
+) -> miette::Result<String> {
+    generate_proof_file_with_options(
+        test,
+        test_id,
+        lean_test_name,
+        lean_module,
+        existential_mode,
+        target,
+        ProofGenerationOptions {
+            force_sampled_fallback: true,
         },
+    )
+}
+
+fn preflight_validate_test_with_force_sampled_fallback(
+    test: &ExportedPropertyTest,
+    existential_mode: ExistentialMode,
+    target: &VerificationTargetKind,
+) -> miette::Result<()> {
+    preflight_validate_test_with_options(
+        test,
+        existential_mode,
+        target,
+        ProofGenerationOptions {
+            force_sampled_fallback: true,
+        },
+    )
+}
+
+fn generate_lean_workspace_with_force_sampled_fallback(
+    tests: &[ExportedPropertyTest],
+    config: &VerifyConfig,
+    skip_unsupported: bool,
+) -> miette::Result<GeneratedManifest> {
+    generate_lean_workspace_with_options(
+        tests,
+        config,
+        skip_unsupported,
+        ProofGenerationOptions {
+            force_sampled_fallback: true,
+        },
+    )
+}
+
+fn fixture_semantics_opaque() -> FuzzerSemantics {
+    FuzzerSemantics::Opaque {
+        reason: "test fixture semantics not set".to_string(),
+    }
+}
+
+fn default_fixture_semantics_for_output_type(output_type: &FuzzerOutputType) -> FuzzerSemantics {
+    match output_type {
+        FuzzerOutputType::Int => FuzzerSemantics::IntRange {
+            min: None,
+            max: None,
+        },
+        FuzzerOutputType::Bool => FuzzerSemantics::Bool,
+        FuzzerOutputType::ByteArray => FuzzerSemantics::ByteArrayRange {
+            min_len: None,
+            max_len: None,
+        },
+        FuzzerOutputType::String => FuzzerSemantics::String,
+        FuzzerOutputType::Data | FuzzerOutputType::Unsupported(_) => FuzzerSemantics::Data,
+        FuzzerOutputType::List(element_type) => FuzzerSemantics::List {
+            element: Box::new(default_fixture_semantics_for_output_type(
+                element_type.as_ref(),
+            )),
+            min_len: Some(0),
+            max_len: None,
+        },
+        FuzzerOutputType::Tuple(types) => FuzzerSemantics::Product(
+            types
+                .iter()
+                .map(default_fixture_semantics_for_output_type)
+                .collect(),
+        ),
+        FuzzerOutputType::Pair(fst, snd) => FuzzerSemantics::Product(vec![
+            default_fixture_semantics_for_output_type(fst.as_ref()),
+            default_fixture_semantics_for_output_type(snd.as_ref()),
+        ]),
+    }
+}
+
+fn derive_fixture_semantics_from_constraint(
+    output_type: &FuzzerOutputType,
+    constraint: &FuzzerConstraint,
+    allow_default_for_any: bool,
+) -> FuzzerSemantics {
+    match constraint {
+        FuzzerConstraint::Any => {
+            if allow_default_for_any {
+                default_fixture_semantics_for_output_type(output_type)
+            } else {
+                fixture_semantics_opaque()
+            }
+        }
+        FuzzerConstraint::IntRange { min, max } => match output_type {
+            FuzzerOutputType::Int => FuzzerSemantics::IntRange {
+                min: Some(min.clone()),
+                max: Some(max.clone()),
+            },
+            FuzzerOutputType::Tuple(types) => {
+                let elems: Vec<FuzzerSemantics> = types
+                    .iter()
+                    .map(|ty| {
+                        if matches!(ty, FuzzerOutputType::Int) {
+                            FuzzerSemantics::IntRange {
+                                min: Some(min.clone()),
+                                max: Some(max.clone()),
+                            }
+                        } else {
+                            default_fixture_semantics_for_output_type(ty)
+                        }
+                    })
+                    .collect();
+                if elems
+                    .iter()
+                    .any(|sem| matches!(sem, FuzzerSemantics::IntRange { .. }))
+                {
+                    FuzzerSemantics::Product(elems)
+                } else {
+                    fixture_semantics_opaque()
+                }
+            }
+            FuzzerOutputType::Pair(fst, snd) => {
+                let mut elems = vec![
+                    default_fixture_semantics_for_output_type(fst.as_ref()),
+                    default_fixture_semantics_for_output_type(snd.as_ref()),
+                ];
+                let mut has_int = false;
+                if matches!(fst.as_ref(), FuzzerOutputType::Int) {
+                    elems[0] = FuzzerSemantics::IntRange {
+                        min: Some(min.clone()),
+                        max: Some(max.clone()),
+                    };
+                    has_int = true;
+                }
+                if matches!(snd.as_ref(), FuzzerOutputType::Int) {
+                    elems[1] = FuzzerSemantics::IntRange {
+                        min: Some(min.clone()),
+                        max: Some(max.clone()),
+                    };
+                    has_int = true;
+                }
+                if has_int {
+                    FuzzerSemantics::Product(elems)
+                } else {
+                    fixture_semantics_opaque()
+                }
+            }
+            _ => fixture_semantics_opaque(),
+        },
+        FuzzerConstraint::ByteStringLenRange { min_len, max_len } => match output_type {
+            FuzzerOutputType::ByteArray | FuzzerOutputType::String => {
+                FuzzerSemantics::ByteArrayRange {
+                    min_len: Some(*min_len),
+                    max_len: Some(*max_len),
+                }
+            }
+            _ => fixture_semantics_opaque(),
+        },
+        FuzzerConstraint::Exact(value) => match (output_type, value) {
+            (FuzzerOutputType::Bool, FuzzerExactValue::Bool(value)) => {
+                FuzzerSemantics::Exact(FuzzerExactValue::Bool(*value))
+            }
+            (FuzzerOutputType::ByteArray, FuzzerExactValue::ByteArray(bytes)) => {
+                FuzzerSemantics::Exact(FuzzerExactValue::ByteArray(bytes.clone()))
+            }
+            (FuzzerOutputType::String, FuzzerExactValue::String(value)) => {
+                FuzzerSemantics::Exact(FuzzerExactValue::String(value.clone()))
+            }
+            _ => fixture_semantics_opaque(),
+        },
+        FuzzerConstraint::Tuple(parts) => match output_type {
+            FuzzerOutputType::Tuple(types) if types.len() == parts.len() => {
+                FuzzerSemantics::Product(
+                    types
+                        .iter()
+                        .zip(parts.iter())
+                        .map(|(ty, part)| derive_fixture_semantics_from_constraint(ty, part, true))
+                        .collect(),
+                )
+            }
+            FuzzerOutputType::Pair(fst, snd) if parts.len() == 2 => FuzzerSemantics::Product(vec![
+                derive_fixture_semantics_from_constraint(fst.as_ref(), &parts[0], true),
+                derive_fixture_semantics_from_constraint(snd.as_ref(), &parts[1], true),
+            ]),
+            _ => fixture_semantics_opaque(),
+        },
+        FuzzerConstraint::List {
+            elem,
+            min_len,
+            max_len,
+        } => match output_type {
+            FuzzerOutputType::List(element_type) => FuzzerSemantics::List {
+                element: Box::new(derive_fixture_semantics_from_constraint(
+                    element_type.as_ref(),
+                    elem.as_ref(),
+                    true,
+                )),
+                min_len: *min_len,
+                max_len: *max_len,
+            },
+            _ => fixture_semantics_opaque(),
+        },
+        FuzzerConstraint::DataConstructorTags { tags } => match output_type {
+            FuzzerOutputType::Data | FuzzerOutputType::Unsupported(_) => {
+                FuzzerSemantics::Constructors { tags: tags.clone() }
+            }
+            _ => fixture_semantics_opaque(),
+        },
+        FuzzerConstraint::And(parts) => {
+            let mut best = None;
+            for part in parts {
+                let semantics = derive_fixture_semantics_from_constraint(
+                    output_type,
+                    part,
+                    allow_default_for_any,
+                );
+                if !matches!(semantics, FuzzerSemantics::Opaque { .. }) {
+                    best = Some(semantics);
+                    break;
+                }
+            }
+            best.unwrap_or_else(|| {
+                if allow_default_for_any {
+                    default_fixture_semantics_for_output_type(output_type)
+                } else {
+                    fixture_semantics_opaque()
+                }
+            })
+        }
+        FuzzerConstraint::Map(_) | FuzzerConstraint::Unsupported { .. } => {
+            fixture_semantics_opaque()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProofBenchmarkMetrics {
+    theorem_size_bytes: usize,
+    helper_count: usize,
+    theorem_count: usize,
+    sampled_fallback: bool,
+    has_reachability_helpers: bool,
+}
+
+fn collect_proof_benchmark_metrics(proof: &str) -> ProofBenchmarkMetrics {
+    ProofBenchmarkMetrics {
+        theorem_size_bytes: proof.len(),
+        helper_count: proof
+            .lines()
+            .filter(|line| line.trim_start().starts_with("def "))
+            .count(),
+        theorem_count: proof
+            .lines()
+            .filter(|line| line.trim_start().starts_with("theorem "))
+            .count(),
+        sampled_fallback: proof.contains("match sampleFuzzerValue"),
+        has_reachability_helpers: proof
+            .contains("-- compiler-exported state-machine reachability relation"),
+    }
+}
+
+fn generate_proof_for_phase12_case(
+    test: &ExportedPropertyTest,
+    force_sampled_fallback: bool,
+) -> miette::Result<String> {
+    let aiken_name = test
+        .name
+        .rsplit('.')
+        .next()
+        .expect("exported test names should include module and test segments");
+    let id = test_id(&test.module, aiken_name);
+    let lean_name = sanitize_lean_name(aiken_name);
+    let lean_module = format!(
+        "AikenVerify.Proofs.{}.{}",
+        module_to_lean_segment(&test.module),
+        lean_name
+    );
+
+    if force_sampled_fallback {
+        generate_proof_file_with_force_sampled_fallback(
+            test,
+            &id,
+            &lean_name,
+            &lean_module,
+            ExistentialMode::default(),
+            &VerificationTargetKind::default(),
+        )
+    } else {
+        generate_proof_file(
+            test,
+            &id,
+            &lean_name,
+            &lean_module,
+            ExistentialMode::default(),
+            &VerificationTargetKind::default(),
+        )
+    }
+}
+
+fn expect_data_schema<'a>(
+    schema: &'a ExportedDataSchema,
+    reference: &Reference,
+    context: &str,
+) -> &'a Data {
+    let definition = schema
+        .definitions
+        .lookup(reference)
+        .unwrap_or_else(|| panic!("missing schema definition for {context}"));
+
+    match &definition.annotated {
+        Schema::Data(data) => data,
+        other => panic!("expected Data schema for {context}, got {other:?}"),
+    }
+}
+
+fn expect_referenced_data<'a>(declaration: &'a Declaration<Data>, context: &str) -> &'a Reference {
+    match declaration {
+        Declaration::Referenced(reference) => reference,
+        Declaration::Inline(inline) => {
+            panic!("expected referenced schema for {context}, got inline {inline:?}")
+        }
+    }
+}
+
+fn make_state_machine_trace_success_schema() -> ExportedDataSchema {
+    let mut definitions = Definitions::new();
+
+    let output_reference = Reference::new("cardano/transaction/OutputReference");
+    definitions.insert(
+        &output_reference,
+        Annotated::from(Schema::Data(Data::AnyOf(vec![
+            Constructor {
+                index: 0,
+                fields: vec![
+                    Declaration::Inline(Box::new(Data::Bytes)).into(),
+                    Declaration::Inline(Box::new(Data::Integer)).into(),
+                ],
+            }
+            .into(),
+        ]))),
+    );
+
+    let input = Reference::new("cardano/transaction/Input");
+    definitions.insert(
+        &input,
+        Annotated::from(Schema::Data(Data::AnyOf(vec![
+            Constructor {
+                index: 0,
+                fields: vec![
+                    Declaration::Referenced(output_reference.clone()).into(),
+                    Declaration::Inline(Box::new(Data::Integer)).into(),
+                ],
+            }
+            .into(),
+        ]))),
+    );
+
+    let inputs = Reference::new("cardano/transaction/Inputs");
+    definitions.insert(
+        &inputs,
+        Annotated::from(Schema::Data(Data::List(Items::One(
+            Declaration::Referenced(input.clone()),
+        )))),
+    );
+
+    let value = Reference::new("cardano/assets/Value");
+    definitions.insert(
+        &value,
+        Annotated::from(Schema::Data(Data::Map(
+            Declaration::Inline(Box::new(Data::Bytes)),
+            Declaration::Inline(Box::new(Data::Integer)),
+        ))),
+    );
+
+    let transaction = Reference::new("cardano/transaction/Transaction");
+    definitions.insert(
+        &transaction,
+        Annotated::from(Schema::Data(Data::AnyOf(vec![
+            Constructor {
+                index: 0,
+                fields: vec![
+                    Declaration::Referenced(inputs.clone()).into(),
+                    Declaration::Referenced(value.clone()).into(),
+                ],
+            }
+            .into(),
+        ]))),
+    );
+
+    let root = Reference::new("scenario/Transactions");
+    definitions.insert(
+        &root,
+        Annotated::from(Schema::Data(Data::List(Items::One(
+            Declaration::Referenced(transaction),
+        )))),
+    );
+
+    ExportedDataSchema { root, definitions }
+}
+
+fn make_state_machine_trace_failure_schema() -> ExportedDataSchema {
+    let mut schema = make_state_machine_trace_success_schema();
+
+    let labels = Reference::new("scenario/Labels");
+    schema.definitions.insert(
+        &labels,
+        Annotated::from(Schema::Data(Data::List(Items::One(Declaration::Inline(
+            Box::new(Data::Bytes),
+        ))))),
+    );
+
+    let root = Reference::new("scenario/FailureTrace");
+    schema.definitions.insert(
+        &root,
+        Annotated::from(Schema::Data(Data::List(Items::Many(vec![
+            Declaration::Referenced(labels).into(),
+            Declaration::Referenced(schema.root.clone()).into(),
+        ])))),
+    );
+    schema.root = root;
+    schema
+}
+
+fn make_state_machine_transition_semantics() -> StateMachineTransitionSemantics {
+    StateMachineTransitionSemantics {
+        terminal_tag: 0,
+        step_tag: 1,
+        label_field_index: 0,
+        next_state_field_index: 1,
+        event_field_index: 2,
+        state_semantics: Box::new(FuzzerSemantics::Opaque {
+            reason: "semantic type 'permissions/State' requires structural schema for precise lowering".to_string(),
+        }),
+        step_input_semantics: vec![FuzzerSemantics::List {
+            element: Box::new(FuzzerSemantics::Opaque {
+                reason: "semantic type 'cardano/transaction.Input' requires structural schema for precise lowering".to_string(),
+            }),
+            min_len: Some(0),
+            max_len: None,
+        }],
+        label_semantics: Box::new(FuzzerSemantics::List {
+            element: Box::new(FuzzerSemantics::String),
+            min_len: Some(0),
+            max_len: None,
+        }),
+        event_semantics: Box::new(FuzzerSemantics::Opaque {
+            reason: "semantic type 'cardano/transaction.Transaction' requires structural schema for precise lowering".to_string(),
+        }),
+    }
+}
+
+fn make_phase12_state_machine_test(
+    name: &str,
+    acceptance: StateMachineAcceptance,
+) -> ExportedPropertyTest {
+    match acceptance {
+        StateMachineAcceptance::AcceptsSuccess => {
+            let mut test = make_test_with_type(
+                "permissions.test",
+                name,
+                FuzzerOutputType::List(Box::new(FuzzerOutputType::Unsupported(
+                    "cardano/transaction.Transaction".to_string(),
+                ))),
+                FuzzerConstraint::List {
+                    elem: Box::new(FuzzerConstraint::Any),
+                    min_len: Some(0),
+                    max_len: None,
+                },
+            );
+            test.return_mode = TestReturnMode::Void;
+            test.semantics = FuzzerSemantics::StateMachineTrace {
+                acceptance,
+                state_type: FuzzerOutputType::Unsupported("permissions/State".to_string()),
+                step_input_types: vec![FuzzerOutputType::List(Box::new(
+                    FuzzerOutputType::Unsupported("cardano/transaction.Input".to_string()),
+                ))],
+                label_type: FuzzerOutputType::List(Box::new(FuzzerOutputType::String)),
+                event_type:
+                    FuzzerOutputType::Unsupported("cardano/transaction.Transaction".to_string()),
+                transition_semantics: make_state_machine_transition_semantics(),
+                output_semantics: Box::new(FuzzerSemantics::List {
+                    element: Box::new(FuzzerSemantics::Opaque {
+                        reason: "semantic type 'cardano/transaction.Transaction' requires structural schema for precise lowering".to_string(),
+                    }),
+                    min_len: Some(0),
+                    max_len: None,
+                }),
+            };
+            test.fuzzer_data_schema = Some(make_state_machine_trace_success_schema());
+            test
+        }
+        StateMachineAcceptance::AcceptsFailure => {
+            let mut test =
+                make_test_with_failure("permissions.test", name, OnTestFailure::SucceedEventually);
+            test.return_mode = TestReturnMode::Void;
+            test.fuzzer_output_type = FuzzerOutputType::Tuple(vec![
+                FuzzerOutputType::List(Box::new(FuzzerOutputType::String)),
+                FuzzerOutputType::List(Box::new(FuzzerOutputType::Unsupported(
+                    "cardano/transaction.Transaction".to_string(),
+                ))),
+            ]);
+            test.constraint = FuzzerConstraint::Tuple(vec![
+                FuzzerConstraint::List {
+                    elem: Box::new(FuzzerConstraint::Any),
+                    min_len: Some(0),
+                    max_len: None,
+                },
+                FuzzerConstraint::List {
+                    elem: Box::new(FuzzerConstraint::Any),
+                    min_len: Some(0),
+                    max_len: None,
+                },
+            ]);
+            test.semantics = FuzzerSemantics::StateMachineTrace {
+                acceptance,
+                state_type: FuzzerOutputType::Unsupported("permissions/State".to_string()),
+                step_input_types: vec![FuzzerOutputType::List(Box::new(
+                    FuzzerOutputType::Unsupported("cardano/transaction.Input".to_string()),
+                ))],
+                label_type: FuzzerOutputType::List(Box::new(FuzzerOutputType::String)),
+                event_type:
+                    FuzzerOutputType::Unsupported("cardano/transaction.Transaction".to_string()),
+                transition_semantics: make_state_machine_transition_semantics(),
+                output_semantics: Box::new(FuzzerSemantics::Product(vec![
+                    FuzzerSemantics::List {
+                        element: Box::new(FuzzerSemantics::String),
+                        min_len: Some(1),
+                        max_len: None,
+                    },
+                    FuzzerSemantics::List {
+                        element: Box::new(FuzzerSemantics::Opaque {
+                            reason: "semantic type 'cardano/transaction.Transaction' requires structural schema for precise lowering".to_string(),
+                        }),
+                        min_len: Some(1),
+                        max_len: Some(1),
+                    },
+                ])),
+            };
+            test.fuzzer_data_schema = Some(make_state_machine_trace_failure_schema());
+            test
+        }
     }
 }
 
@@ -279,7 +845,7 @@ fn generate_workspace_dotted_module_creates_matching_path() {
 }
 
 #[test]
-fn generate_workspace_records_sampled_fallback_reasons() {
+fn generate_workspace_requires_explicit_sampled_fallback_mode() {
     let tmp = tempfile::tempdir().unwrap();
     let out_dir = tmp.path().to_path_buf();
     let tests = vec![make_test_with_type(
@@ -297,18 +863,359 @@ fn generate_workspace_records_sampled_fallback_reasons() {
         target: VerificationTargetKind::default(),
     };
 
-    let manifest = generate_lean_workspace(&tests, &config, false).unwrap();
+    let err = generate_lean_workspace(&tests, &config, false).expect_err(
+        "workspace generation should fail when sampled fallback is required without explicit mode",
+    );
+    let message = err.to_string();
+    assert!(message.contains("requires explicit sampled-domain mode (--force-sampled-fallback)"));
+    assert!(message.contains("my_module.test_bool_fallback_manifest"));
+}
+
+#[test]
+fn preflight_requires_explicit_sampled_fallback_mode() {
+    let test = make_test_with_type(
+        "my_module",
+        "test_preflight_bool_fallback",
+        FuzzerOutputType::Bool,
+        FuzzerConstraint::Any,
+    );
+
+    let err = preflight_validate_test_with_options(
+        &test,
+        ExistentialMode::default(),
+        &VerificationTargetKind::default(),
+        ProofGenerationOptions {
+            force_sampled_fallback: false,
+        },
+    )
+    .expect_err("preflight should fail when sampled fallback would be implicit");
+
+    assert!(
+        err.to_string()
+            .contains("requires explicit sampled-domain mode (--force-sampled-fallback)"),
+        "preflight should explain explicit sampled mode requirement: {err}"
+    );
+}
+
+#[test]
+fn generate_proof_requires_explicit_sampled_fallback_mode() {
+    let test = make_test_with_type(
+        "my_module",
+        "test_proof_bool_fallback",
+        FuzzerOutputType::Bool,
+        FuzzerConstraint::Any,
+    );
+    let id = test_id("my_module", "test_proof_bool_fallback");
+    let lean_name = sanitize_lean_name("test_proof_bool_fallback");
+    let lean_module = "AikenVerify.Proofs.My_module.test_proof_bool_fallback";
+
+    let err = generate_proof_file_with_options(
+        &test,
+        &id,
+        &lean_name,
+        lean_module,
+        ExistentialMode::default(),
+        &VerificationTargetKind::default(),
+        ProofGenerationOptions {
+            force_sampled_fallback: false,
+        },
+    )
+    .expect_err("proof generation should fail when sampled fallback would be implicit");
+
+    let message = err.to_string();
+    assert!(message.contains("requires explicit sampled-domain mode (--force-sampled-fallback)"));
+    assert!(message.contains("test_proof_bool_fallback"));
+}
+
+#[test]
+fn generate_workspace_scenario_like_void_property_uses_sampled_fallback_in_explicit_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().to_path_buf();
+    let mut test = make_test_with_type(
+        "permissions.test",
+        "prop_permissions_core_development_standard_ok",
+        FuzzerOutputType::List(Box::new(FuzzerOutputType::Unsupported(
+            "cardano/transaction.Transaction".to_string(),
+        ))),
+        FuzzerConstraint::List {
+            elem: Box::new(FuzzerConstraint::Any),
+            min_len: Some(0),
+            max_len: None,
+        },
+    );
+    test.return_mode = TestReturnMode::Void;
+    test.semantics = FuzzerSemantics::StateMachineTrace {
+        acceptance: StateMachineAcceptance::AcceptsSuccess,
+        state_type: FuzzerOutputType::Unsupported("permissions/State".to_string()),
+        step_input_types: vec![FuzzerOutputType::List(Box::new(
+            FuzzerOutputType::Unsupported("cardano/transaction.Input".to_string()),
+        ))],
+        label_type: FuzzerOutputType::List(Box::new(FuzzerOutputType::String)),
+        event_type: FuzzerOutputType::Unsupported("cardano/transaction.Transaction".to_string()),
+        transition_semantics: make_state_machine_transition_semantics(),
+        output_semantics: Box::new(FuzzerSemantics::List {
+            element: Box::new(FuzzerSemantics::Opaque {
+                reason: "semantic type 'cardano/transaction.Transaction' requires structural schema for precise lowering".to_string(),
+            }),
+            min_len: Some(0),
+            max_len: None,
+        }),
+    };
+
+    let config = VerifyConfig {
+        out_dir: out_dir.clone(),
+        cek_budget: 20000,
+        blaster_rev: DEFAULT_BLASTER_REV.to_string(),
+        existential_mode: ExistentialMode::default(),
+        target: VerificationTargetKind::default(),
+    };
+
+    let manifest = generate_lean_workspace_with_options(
+        &[test],
+        &config,
+        false,
+        ProofGenerationOptions {
+            force_sampled_fallback: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(manifest.tests.len(), 1);
     assert_eq!(manifest.fallbacks.len(), 1);
-    assert_eq!(
-        manifest.fallbacks[0].name,
-        "my_module.test_bool_fallback_manifest"
+
+    let entry = &manifest.tests[0];
+    let proof = fs::read_to_string(out_dir.join(&entry.lean_file)).unwrap();
+    assert!(
+        proof.contains(&format!(
+            "#import_uplc fuzzer_prog_{} single_cbor_hex",
+            entry.id
+        )),
+        "Scenario-like unsupported list domains should import the fuzzer program for sampled fallback"
     );
     assert!(
-        manifest.fallbacks[0]
-            .reason
-            .contains("no extractable scalar-domain predicates"),
-        "Expected explicit fallback reason, got: {:?}",
-        manifest.fallbacks[0]
+        proof.contains(&format!(
+            "match sampleFuzzerValue fuzzer_prog_{} seed with",
+            entry.id
+        )),
+        "Scenario-like unsupported list domains should use sampled fallback, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("proveTestsHalt"),
+        "Void-returning scenario-like property should still target proveTestsHalt, got:\n{proof}"
+    );
+}
+
+#[test]
+fn generate_workspace_scenario_like_void_property_uses_schema_backed_direct_theorem() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().to_path_buf();
+    let mut test = make_test_with_type(
+        "permissions.test",
+        "prop_permissions_core_development_standard_ok",
+        FuzzerOutputType::List(Box::new(FuzzerOutputType::Unsupported(
+            "cardano/transaction.Transaction".to_string(),
+        ))),
+        FuzzerConstraint::List {
+            elem: Box::new(FuzzerConstraint::Any),
+            min_len: Some(0),
+            max_len: None,
+        },
+    );
+    test.return_mode = TestReturnMode::Void;
+    test.semantics = FuzzerSemantics::StateMachineTrace {
+        acceptance: StateMachineAcceptance::AcceptsSuccess,
+        state_type: FuzzerOutputType::Unsupported("permissions/State".to_string()),
+        step_input_types: vec![FuzzerOutputType::List(Box::new(
+            FuzzerOutputType::Unsupported("cardano/transaction.Input".to_string()),
+        ))],
+        label_type: FuzzerOutputType::List(Box::new(FuzzerOutputType::String)),
+        event_type: FuzzerOutputType::Unsupported("cardano/transaction.Transaction".to_string()),
+        transition_semantics: make_state_machine_transition_semantics(),
+        output_semantics: Box::new(FuzzerSemantics::List {
+            element: Box::new(FuzzerSemantics::Opaque {
+                reason: "semantic type 'cardano/transaction.Transaction' requires structural schema for precise lowering".to_string(),
+            }),
+            min_len: Some(0),
+            max_len: None,
+        }),
+    };
+    test.fuzzer_data_schema = Some(make_state_machine_trace_success_schema());
+
+    let config = VerifyConfig {
+        out_dir: out_dir.clone(),
+        cek_budget: 20000,
+        blaster_rev: DEFAULT_BLASTER_REV.to_string(),
+        existential_mode: ExistentialMode::default(),
+        target: VerificationTargetKind::default(),
+    };
+
+    let manifest = generate_lean_workspace(&[test], &config, false).unwrap();
+    assert!(
+        manifest.fallbacks.is_empty(),
+        "schema-backed scenario lowering should stay direct, got fallbacks: {:?}",
+        manifest.fallbacks
+    );
+
+    let entry = &manifest.tests[0];
+    let proof = fs::read_to_string(out_dir.join(&entry.lean_file)).unwrap();
+    assert!(
+        !proof.contains(&format!(
+            "#import_uplc fuzzer_prog_{} single_cbor_hex",
+            entry.id
+        )),
+        "schema-backed direct theorem should not import the fuzzer program, got:\n{proof}"
+    );
+    assert!(
+        !proof.contains("match sampleFuzzerValue"),
+        "schema-backed direct theorem should not use sampled fallback, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("-- compiler-exported structural domain predicate"),
+        "schema-backed direct theorem should emit Lean helper predicates, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("-- compiler-exported state-machine reachability relation"),
+        "schema-backed direct theorem should emit reachability helpers, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("_reachability_step_relation"),
+        "schema-backed direct theorem should include per-step transition relation helpers, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("_reachability_trace_is_terminal"),
+        "schema-backed direct theorem should include terminal-state condition helpers, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("project_output (events : List Data) : Data := Data.List events"),
+        "success-state reachability lowering should project events into theorem output, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("theorem prop_permissions_core_development_standard_ok :\n  ∀ (x : Data),"),
+        "schema-backed direct theorem should quantify over structured Data, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("| Data.Map entries =>"),
+        "schema-backed direct theorem should preserve map-shaped transaction fields, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("| Data.List xs =>"),
+        "schema-backed direct theorem should preserve list-shaped transaction fields, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("proveTestsHalt"),
+        "schema-backed direct theorem should preserve Void success mode, got:\n{proof}"
+    );
+}
+
+#[test]
+fn generate_workspace_scenario_like_fail_property_uses_schema_backed_direct_theorem() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().to_path_buf();
+    let mut test = make_test_with_type(
+        "permissions.test",
+        "prop_permissions_core_development_standard_ko",
+        FuzzerOutputType::Tuple(vec![
+            FuzzerOutputType::List(Box::new(FuzzerOutputType::String)),
+            FuzzerOutputType::List(Box::new(FuzzerOutputType::Unsupported(
+                "cardano/transaction.Transaction".to_string(),
+            ))),
+        ]),
+        FuzzerConstraint::Tuple(vec![
+            FuzzerConstraint::List {
+                elem: Box::new(FuzzerConstraint::Any),
+                min_len: Some(0),
+                max_len: None,
+            },
+            FuzzerConstraint::List {
+                elem: Box::new(FuzzerConstraint::Any),
+                min_len: Some(0),
+                max_len: None,
+            },
+        ]),
+    );
+    test.return_mode = TestReturnMode::Void;
+    test.on_test_failure = OnTestFailure::SucceedEventually;
+    test.semantics = FuzzerSemantics::StateMachineTrace {
+        acceptance: StateMachineAcceptance::AcceptsFailure,
+        state_type: FuzzerOutputType::Unsupported("permissions/State".to_string()),
+        step_input_types: vec![FuzzerOutputType::List(Box::new(
+            FuzzerOutputType::Unsupported("cardano/transaction.Input".to_string()),
+        ))],
+        label_type: FuzzerOutputType::List(Box::new(FuzzerOutputType::String)),
+        event_type: FuzzerOutputType::Unsupported("cardano/transaction.Transaction".to_string()),
+        transition_semantics: make_state_machine_transition_semantics(),
+        output_semantics: Box::new(FuzzerSemantics::Product(vec![
+            FuzzerSemantics::List {
+                element: Box::new(FuzzerSemantics::String),
+                min_len: Some(1),
+                max_len: None,
+            },
+            FuzzerSemantics::List {
+                element: Box::new(FuzzerSemantics::Opaque {
+                    reason: "semantic type 'cardano/transaction.Transaction' requires structural schema for precise lowering".to_string(),
+                }),
+                min_len: Some(1),
+                max_len: Some(1),
+            },
+        ])),
+    };
+    test.fuzzer_data_schema = Some(make_state_machine_trace_failure_schema());
+
+    let config = VerifyConfig {
+        out_dir: out_dir.clone(),
+        cek_budget: 20000,
+        blaster_rev: DEFAULT_BLASTER_REV.to_string(),
+        existential_mode: ExistentialMode::default(),
+        target: VerificationTargetKind::default(),
+    };
+
+    let manifest = generate_lean_workspace(&[test], &config, false).unwrap();
+    assert!(
+        manifest.fallbacks.is_empty(),
+        "schema-backed failure trace lowering should stay direct, got fallbacks: {:?}",
+        manifest.fallbacks
+    );
+
+    let entry = &manifest.tests[0];
+    let proof = fs::read_to_string(out_dir.join(&entry.lean_file)).unwrap();
+    assert!(
+        !proof.contains("match sampleFuzzerValue"),
+        "schema-backed failure theorem should not use sampled fallback, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("theorem prop_permissions_core_development_standard_ko :\n  ∀ (x : Data),"),
+        "failure trace theorem should quantify over structured Data, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("| Data.List [x_0, x_1] =>"),
+        "failure trace schema should preserve tuple-like root shape, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("(1 <= xs.length)"),
+        "failure trace semantics should require a non-empty label list, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("(1 <= xs.length ∧ xs.length <= 1)"),
+        "failure trace semantics should require a singleton failing event trace, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("-- compiler-exported state-machine reachability relation"),
+        "failure trace theorem should emit reachability helpers, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("_reachability_reachable_from"),
+        "failure trace theorem should include recursive reachability relation, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("project_output (labels events : List Data) : Data :="),
+        "failure-state reachability lowering should emit acceptance-specific output projection helper, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("Data.List [Data.List labels, Data.List events]"),
+        "failure-state output projection should preserve labels/event payload structure, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("proveTestsError"),
+        "failure trace theorem should preserve Void+fail mode, got:\n{proof}"
     );
 }
 
@@ -723,7 +1630,7 @@ fn fail_once_data_witness_mode_uses_valid_data_constructor() {
     let lean_name = sanitize_lean_name("test_data_exist");
     let lean_module = "AikenVerify.Proofs.My_module.test_data_exist";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -768,7 +1675,7 @@ fn fail_once_unsupported_witness_mode_uses_valid_data_constructor() {
     let lean_name = sanitize_lean_name("test_adt_exist");
     let lean_module = "AikenVerify.Proofs.My_module.test_adt_exist";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1037,6 +1944,9 @@ fn make_test_with_type(
     constraint: FuzzerConstraint,
 ) -> ExportedPropertyTest {
     let module_path = module.replace('.', "/");
+    let semantics =
+        derive_fixture_semantics_from_constraint(&fuzzer_output_type, &constraint, false);
+
     ExportedPropertyTest {
         name: format!("{module}.{name}"),
         module: module.to_string(),
@@ -1056,6 +1966,8 @@ fn make_test_with_type(
         fuzzer_type: format!("Fuzzer<{:?}>", fuzzer_output_type),
         fuzzer_output_type,
         constraint,
+        semantics,
+        fuzzer_data_schema: None,
     }
 }
 
@@ -1071,7 +1983,7 @@ fn bool_without_domain_predicate_uses_sampled_domain_fallback() {
     let lean_name = sanitize_lean_name("test_bool");
     let lean_module = "AikenVerify.Proofs.My_module.test_bool";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1117,7 +2029,7 @@ fn sampled_domain_fallback_imports_fuzzer_program() {
     let lean_name = sanitize_lean_name("test_bool_fallback_import");
     let lean_module = "AikenVerify.Proofs.My_module.test_bool_fallback_import";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1198,7 +2110,7 @@ fn bool_succeed_eventually_generates_false() {
     let lean_name = sanitize_lean_name("test_bool_fail");
     let lean_module = "AikenVerify.Proofs.My_module.test_bool_fail";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1325,7 +2237,7 @@ fn tuple_int_int_component_bounds_wrong_arity_uses_fallback() {
     let lean_name = sanitize_lean_name("test_pair_components_bad_arity");
     let lean_module = "AikenVerify.Proofs.My_module.test_pair_components_bad_arity";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1352,7 +2264,7 @@ fn tuple_int_int_unknown_bounds_use_fallback() {
     let lean_name = sanitize_lean_name("test_pair_nobound");
     let lean_module = "AikenVerify.Proofs.My_module.test_pair_nobound";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1368,6 +2280,127 @@ fn tuple_int_int_unknown_bounds_use_fallback() {
 }
 
 #[test]
+fn bool_semantics_can_generate_direct_theorem_without_constraint_predicates() {
+    let mut test = make_test_with_type(
+        "my_module",
+        "test_bool_semantics_direct",
+        FuzzerOutputType::Bool,
+        FuzzerConstraint::Unsupported {
+            reason: "legacy extractor intentionally unsupported".to_string(),
+        },
+    );
+    test.semantics = FuzzerSemantics::Bool;
+
+    let proof = generate_proof_file(
+        &test,
+        "test_bool_semantics_direct",
+        "test_bool_semantics_direct",
+        "AikenVerify.Proofs.My_module.test_bool_semantics_direct",
+        ExistentialMode::default(),
+        &VerificationTargetKind::default(),
+    )
+    .unwrap();
+
+    assert!(
+        proof.contains("theorem test_bool_semantics_direct :\n  ∀ (x : Bool),"),
+        "semantics-based Bool direct theorem should quantify over the full Bool domain, got:\n{proof}"
+    );
+    assert!(
+        !proof.contains("match sampleFuzzerValue"),
+        "semantics-based Bool lowering should bypass sampled fallback, got:\n{proof}"
+    );
+}
+
+#[test]
+fn int_semantics_range_takes_precedence_over_legacy_constraint_bounds() {
+    let mut test = make_test_with_type(
+        "my_module",
+        "test_int_semantics_override",
+        FuzzerOutputType::Int,
+        FuzzerConstraint::IntRange {
+            min: "0".to_string(),
+            max: "10".to_string(),
+        },
+    );
+    test.semantics = FuzzerSemantics::IntRange {
+        min: Some("100".to_string()),
+        max: Some("100".to_string()),
+    };
+
+    let proof = generate_proof_file(
+        &test,
+        "test_int_semantics_override",
+        "test_int_semantics_override",
+        "AikenVerify.Proofs.My_module.test_int_semantics_override",
+        ExistentialMode::default(),
+        &VerificationTargetKind::default(),
+    )
+    .unwrap();
+
+    assert!(
+        proof.contains("(100 <= x && x <= 100)"),
+        "semantics-based Int lowering should use semantic bounds, got:\n{proof}"
+    );
+    assert!(
+        !proof.contains("(0 <= x && x <= 10)"),
+        "legacy constraint bounds must not leak into semantics-based Int lowering, got:\n{proof}"
+    );
+    assert!(
+        !proof.contains("match sampleFuzzerValue"),
+        "semantics-based Int lowering should bypass sampled fallback, got:\n{proof}"
+    );
+}
+
+#[test]
+fn non_state_machine_direct_generation_requires_semantics_not_legacy_constraints() {
+    let mut test = make_test_with_type(
+        "my_module",
+        "test_semantics_cutover_int",
+        FuzzerOutputType::Int,
+        FuzzerConstraint::IntRange {
+            min: "0".to_string(),
+            max: "10".to_string(),
+        },
+    );
+    test.semantics = FuzzerSemantics::Opaque {
+        reason: "test fixture forces semantic fallback".to_string(),
+    };
+
+    let id = test_id("my_module", "test_semantics_cutover_int");
+    let lean_name = sanitize_lean_name("test_semantics_cutover_int");
+    let lean_module = "AikenVerify.Proofs.My_module.test_semantics_cutover_int";
+
+    let err = generate_proof_file_with_options(
+        &test,
+        &id,
+        &lean_name,
+        lean_module,
+        ExistentialMode::default(),
+        &VerificationTargetKind::default(),
+        ProofGenerationOptions {
+            force_sampled_fallback: false,
+        },
+    )
+    .expect_err("opaque semantics must not silently reuse legacy constraint lowering");
+
+    let message = err.to_string();
+    assert!(message.contains("requires explicit sampled-domain mode (--force-sampled-fallback)"));
+    assert!(message.contains("semantic direct-domain lowering is unavailable"));
+
+    let proof = generate_proof_file_with_force_sampled_fallback(
+        &test,
+        &id,
+        &lean_name,
+        lean_module,
+        ExistentialMode::default(),
+        &VerificationTargetKind::default(),
+    )
+    .expect("explicit sampled fallback should remain available");
+
+    assert!(proof.contains("match sampleFuzzerValue"));
+}
+
+#[test]
 fn bytearray_without_domain_predicate_uses_sampled_domain_fallback() {
     let test = make_test_with_type(
         "my_module",
@@ -1379,7 +2412,7 @@ fn bytearray_without_domain_predicate_uses_sampled_domain_fallback() {
     let lean_name = sanitize_lean_name("test_bytes");
     let lean_module = "AikenVerify.Proofs.My_module.test_bytes";
 
-    let result = generate_proof_file(
+    let result = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1583,7 +2616,7 @@ fn list_without_bounds_uses_sampled_domain_fallback() {
     let lean_name = sanitize_lean_name("test_list");
     let lean_module = "AikenVerify.Proofs.My_module.test_list";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1616,7 +2649,7 @@ fn list_with_any_constraint_uses_sampled_domain_fallback() {
     let lean_name = sanitize_lean_name("test_list_any");
     let lean_module = "AikenVerify.Proofs.My_module.test_list_any";
 
-    let result = generate_proof_file(
+    let result = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1646,7 +2679,7 @@ fn list_with_unsupported_constraint_uses_sampled_domain_fallback() {
     let lean_name = sanitize_lean_name("test_list_unsupported");
     let lean_module = "AikenVerify.Proofs.My_module.test_list_unsupported";
 
-    let result = generate_proof_file(
+    let result = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1665,7 +2698,7 @@ fn list_with_unsupported_constraint_uses_sampled_domain_fallback() {
 }
 
 #[test]
-fn list_data_with_zero_lower_bound_generates_direct_theorem() {
+fn list_unsupported_element_with_only_zero_lower_bound_uses_fallback() {
     let test = make_test_with_type(
         "my_module",
         "test_list_data_min_zero",
@@ -1682,7 +2715,7 @@ fn list_data_with_zero_lower_bound_generates_direct_theorem() {
     let lean_name = sanitize_lean_name("test_list_data_min_zero");
     let lean_module = "AikenVerify.Proofs.My_module.test_list_data_min_zero";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1693,16 +2726,14 @@ fn list_data_with_zero_lower_bound_generates_direct_theorem() {
     .unwrap();
 
     assert!(
-        proof.contains("∀ (xs : List Data),"),
-        "List<Data>-like scenario domains should be quantified directly, got:\n{proof}"
+        proof.contains(&format!(
+            "match sampleFuzzerValue fuzzer_prog_{id} seed with"
+        )),
+        "Unsupported list elements should use sampled-domain fallback even with min_len=0, got:\n{proof}"
     );
     assert!(
-        proof.contains("(0 <= xs.length)"),
-        "List lower-bound predicate should be preserved, got:\n{proof}"
-    );
-    assert!(
-        !proof.contains("match sampleFuzzerValue"),
-        "Explicit list domains should avoid sampled fallback, got:\n{proof}"
+        !proof.contains("∀ (xs : List Data),"),
+        "Unsupported list elements should not stay on the direct theorem path, got:\n{proof}"
     );
 }
 
@@ -1756,7 +2787,7 @@ fn int_with_unsupported_constraint_uses_sampled_domain_fallback() {
     let lean_name = sanitize_lean_name("test_int_unsupported");
     let lean_module = "AikenVerify.Proofs.My_module.test_int_unsupported";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1838,7 +2869,7 @@ fn existential_int_and_with_unsupported_uses_sampled_fallback() {
     let lean_name = sanitize_lean_name("test_int_partial_salvage_existential");
     let lean_module = "AikenVerify.Proofs.My_module.test_int_partial_salvage_existential";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1874,7 +2905,7 @@ fn list_data_without_domain_predicate_uses_fuzzer_domain_fallback() {
     let lean_name = sanitize_lean_name("test_list_data_unconstrained");
     let lean_module = "AikenVerify.Proofs.My_module.test_list_data_unconstrained";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1919,7 +2950,7 @@ fn list_unsupported_element_without_domain_predicate_uses_fuzzer_domain_fallback
     let lean_name = sanitize_lean_name("test_list_transaction_like");
     let lean_module = "AikenVerify.Proofs.My_module.test_list_transaction_like";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1954,7 +2985,7 @@ fn list_data_fallback_supports_existential_mode() {
     let lean_name = sanitize_lean_name("test_list_data_existential");
     let lean_module = "AikenVerify.Proofs.My_module.test_list_data_existential";
 
-    let result = generate_proof_file(
+    let result = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -1994,7 +3025,7 @@ fn data_without_domain_predicate_uses_sampled_domain_fallback() {
     let lean_name = sanitize_lean_name("test_data");
     let lean_module = "AikenVerify.Proofs.My_module.test_data";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -2022,7 +3053,7 @@ fn tuple_data_data_without_predicates_uses_fallback() {
     let lean_name = sanitize_lean_name("test_data_pair");
     let lean_module = "AikenVerify.Proofs.My_module.test_data_pair";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -2051,7 +3082,7 @@ fn tuple_data_data_data_without_predicates_uses_fallback() {
     let lean_name = sanitize_lean_name("test_data_triple");
     let lean_module = "AikenVerify.Proofs.My_module.test_data_triple";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -2107,6 +3138,46 @@ fn tuple_mixed_int_bool_generates_theorem_with_bounds() {
 }
 
 #[test]
+fn list_semantics_can_generate_direct_theorem_without_constraint_extraction() {
+    let mut test = make_test_with_type(
+        "my_module",
+        "test_list_semantics_direct",
+        FuzzerOutputType::List(Box::new(FuzzerOutputType::Bool)),
+        FuzzerConstraint::Unsupported {
+            reason: "legacy extractor intentionally unsupported".to_string(),
+        },
+    );
+    test.semantics = FuzzerSemantics::List {
+        element: Box::new(FuzzerSemantics::Bool),
+        min_len: Some(1),
+        max_len: Some(3),
+    };
+
+    let proof = generate_proof_file(
+        &test,
+        "test_list_semantics_direct",
+        "test_list_semantics_direct",
+        "AikenVerify.Proofs.My_module.test_list_semantics_direct",
+        ExistentialMode::default(),
+        &VerificationTargetKind::default(),
+    )
+    .unwrap();
+
+    assert!(
+        proof.contains("∀ (xs : List Bool),"),
+        "semantics-based list lowering should quantify over the semantic element type, got:\n{proof}"
+    );
+    assert!(
+        proof.contains("(1 <= xs.length && xs.length <= 3)"),
+        "semantics-based list lowering should preserve semantic length bounds, got:\n{proof}"
+    );
+    assert!(
+        !proof.contains("match sampleFuzzerValue"),
+        "semantics-based list lowering should bypass sampled fallback, got:\n{proof}"
+    );
+}
+
+#[test]
 fn tuple_with_nested_list_element_uses_fallback() {
     let test = make_test_with_type(
         "my_module",
@@ -2121,7 +3192,7 @@ fn tuple_with_nested_list_element_uses_fallback() {
     let lean_name = sanitize_lean_name("test_tuple_nested");
     let lean_module = "AikenVerify.Proofs.My_module.test_tuple_nested";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -2137,7 +3208,7 @@ fn tuple_with_nested_list_element_uses_fallback() {
 }
 
 #[test]
-fn tuple_of_lists_with_explicit_domains_generates_direct_theorem() {
+fn tuple_of_lists_with_unsupported_elements_uses_fallback() {
     let test = make_test_with_type(
         "my_module",
         "test_tuple_list_domains",
@@ -2164,7 +3235,7 @@ fn tuple_of_lists_with_explicit_domains_generates_direct_theorem() {
     let lean_name = sanitize_lean_name("test_tuple_list_domains");
     let lean_module = "AikenVerify.Proofs.My_module.test_tuple_list_domains";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -2175,26 +3246,10 @@ fn tuple_of_lists_with_explicit_domains_generates_direct_theorem() {
     .unwrap();
 
     assert!(
-        proof.contains("∀ (a : List Data) (b : List Data),"),
-        "Tuple(List<Data>, List<Data>) should be quantified directly, got:\n{proof}"
-    );
-    assert!(
-        proof.contains("(0 <= a.length)"),
-        "First list lower bound should be preserved, got:\n{proof}"
-    );
-    assert!(
-        proof.contains("(0 <= b.length)"),
-        "Second list lower bound should be preserved, got:\n{proof}"
-    );
-    assert!(
-        proof.contains(
-            "Data.List [Data.List (a.map (fun x_0 => x_0)), Data.List (b.map (fun x_0 => x_0))]"
-        ),
-        "Tuple list encoding should be inlined as Data.List payloads, got:\n{proof}"
-    );
-    assert!(
-        !proof.contains("match sampleFuzzerValue"),
-        "Explicit tuple/list domains should avoid sampled-domain fallback, got:\n{proof}"
+        proof.contains(&format!(
+            "match sampleFuzzerValue fuzzer_prog_{id} seed with"
+        )),
+        "Tuple/list domains with unsupported elements should use sampled-domain fallback, got:\n{proof}"
     );
 }
 
@@ -3751,6 +4806,128 @@ test foo_mint_cross_module(policy_id via byte_fuzzer()) {
     .unwrap();
 }
 
+fn write_verify_fuzzer_schema_fixture(root: &Path) {
+    fs::create_dir_all(root.join("validators")).unwrap();
+
+    fs::write(
+        root.join("aiken.toml"),
+        r#"
+name = "test/verify_fuzzer_schema_fixture"
+version = "0.0.0"
+plutusVersion = "v3"
+description = "verify fuzzer schema fixture"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("validators/tests.ak"),
+        r#"
+type OutputReference {
+  OutputReference {
+    transaction_id: ByteArray,
+    output_index: Int,
+  }
+}
+
+type Input {
+  Input {
+    output_reference: OutputReference,
+    value: Int,
+  }
+}
+
+type Transaction {
+  Transaction {
+    inputs: List<Input>,
+    fee: Int,
+  }
+}
+
+fn transaction_fuzzer() -> Fuzzer<List<Transaction>> {
+  todo
+}
+
+test prop_transaction_domain_schema(transactions via transaction_fuzzer()) {
+  True
+}
+"#,
+    )
+    .unwrap();
+}
+
+fn write_verify_state_machine_semantics_fixture(root: &Path) {
+    fs::create_dir_all(root.join("validators")).unwrap();
+    fs::create_dir_all(root.join("lib/aiken/fuzz")).unwrap();
+    fs::create_dir_all(root.join("lib/cardano")).unwrap();
+
+    fs::write(
+        root.join("aiken.toml"),
+        r#"
+name = "test/verify_state_machine_semantics_fixture"
+version = "0.0.0"
+plutusVersion = "v3"
+description = "verify state-machine semantics fixture"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("lib/cardano/transaction.ak"),
+        r#"
+pub type Input {
+  Input
+}
+
+pub type Transaction {
+  Transaction
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("lib/aiken/fuzz/scenario.ak"),
+        r#"
+use cardano/transaction.{Input, Transaction}
+
+pub type Scenario<st> {
+  Done
+  Step(List<String>, st, Transaction)
+}
+
+pub fn ok(
+  initial_state: st,
+  step: fn(st, List<Input>) -> Fuzzer<Scenario<st>>,
+) -> Fuzzer<List<Transaction>> {
+  todo
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("validators/tests.ak"),
+        r#"
+use aiken/fuzz/scenario
+use cardano/transaction.{Input, Transaction}
+
+type State {
+  State
+}
+
+fn step(_st: State, _utxo: List<Input>) -> Fuzzer<scenario.Scenario<State>> {
+  todo
+}
+
+test prop_scenario_ok_export(transactions via scenario.ok(State, step)) {
+  True
+}
+"#,
+    )
+    .unwrap();
+}
+
 #[test]
 fn export_path_populates_validator_metadata_for_target_modes() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3875,7 +5052,7 @@ fn export_path_populates_validator_metadata_for_target_modes() {
     );
 
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             test,
             ExistentialMode::default(),
             &VerificationTargetKind::ValidatorHandler,
@@ -3884,13 +5061,196 @@ fn export_path_populates_validator_metadata_for_target_modes() {
         "validator target preflight should succeed for exported fixture"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             test,
             ExistentialMode::default(),
             &VerificationTargetKind::Equivalence,
         )
         .is_ok(),
         "equivalence target preflight should succeed for exported fixture"
+    );
+}
+
+#[test]
+fn export_path_preserves_nested_fuzzer_data_schema() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_verify_fuzzer_schema_fixture(tmp.path());
+
+    let mut project = Project::new(tmp.path().to_path_buf(), EventTarget::default()).unwrap();
+    project.compile(Options::default()).unwrap();
+
+    let exported = project
+        .export_tests(None, false, Tracing::silent(), false)
+        .unwrap();
+    let test = exported
+        .property_tests
+        .iter()
+        .find(|t| t.name.ends_with("prop_transaction_domain_schema"))
+        .expect("fixture should export property test");
+
+    assert!(
+        matches!(
+            &test.semantics,
+            FuzzerSemantics::Opaque { reason }
+            if reason.contains("not structurally understood yet")
+        ),
+        "todo-based schema fixtures should remain opaque in exported semantics, got {:?}",
+        test.semantics
+    );
+
+    let schema = test
+        .fuzzer_data_schema
+        .as_ref()
+        .expect("property test should export fuzzer data schema");
+
+    let transaction_ref = match expect_data_schema(schema, &schema.root, "fuzzer root") {
+        Data::List(Items::One(Declaration::Referenced(reference))) => reference,
+        other => panic!("expected list root schema, got {other:?}"),
+    };
+
+    let transaction_ctor = match expect_data_schema(schema, transaction_ref, "Transaction") {
+        Data::AnyOf(constructors) => {
+            assert_eq!(
+                constructors.len(),
+                1,
+                "Transaction should have one constructor"
+            );
+            &constructors[0].annotated
+        }
+        other => panic!("expected constructor schema for Transaction, got {other:?}"),
+    };
+    assert_eq!(transaction_ctor.index, 0);
+    assert_eq!(transaction_ctor.fields.len(), 2);
+
+    let inputs_ref =
+        expect_referenced_data(&transaction_ctor.fields[0].annotated, "Transaction.inputs");
+    let fee_ref = expect_referenced_data(&transaction_ctor.fields[1].annotated, "Transaction.fee");
+    assert!(
+        matches!(
+            expect_data_schema(schema, fee_ref, "Transaction.fee"),
+            Data::Integer
+        ),
+        "Transaction.fee should remain an integer field"
+    );
+
+    let input_ref = match expect_data_schema(schema, inputs_ref, "List<Input>") {
+        Data::List(Items::One(Declaration::Referenced(reference))) => reference,
+        other => panic!("expected list schema for Transaction.inputs, got {other:?}"),
+    };
+
+    let input_ctor = match expect_data_schema(schema, input_ref, "Input") {
+        Data::AnyOf(constructors) => {
+            assert_eq!(constructors.len(), 1, "Input should have one constructor");
+            &constructors[0].annotated
+        }
+        other => panic!("expected constructor schema for Input, got {other:?}"),
+    };
+    assert_eq!(input_ctor.index, 0);
+    assert_eq!(input_ctor.fields.len(), 2);
+
+    let output_reference_ref =
+        expect_referenced_data(&input_ctor.fields[0].annotated, "Input.output_reference");
+    let input_value_ref = expect_referenced_data(&input_ctor.fields[1].annotated, "Input.value");
+    assert!(
+        matches!(
+            expect_data_schema(schema, input_value_ref, "Input.value"),
+            Data::Integer
+        ),
+        "Input.value should remain an integer field"
+    );
+
+    let output_reference_ctor =
+        match expect_data_schema(schema, output_reference_ref, "OutputReference") {
+            Data::AnyOf(constructors) => {
+                assert_eq!(
+                    constructors.len(),
+                    1,
+                    "OutputReference should have one constructor"
+                );
+                &constructors[0].annotated
+            }
+            other => panic!("expected constructor schema for OutputReference, got {other:?}"),
+        };
+    assert_eq!(output_reference_ctor.index, 0);
+    assert_eq!(output_reference_ctor.fields.len(), 2);
+
+    let transaction_id_ref = expect_referenced_data(
+        &output_reference_ctor.fields[0].annotated,
+        "OutputReference.transaction_id",
+    );
+    let output_index_ref = expect_referenced_data(
+        &output_reference_ctor.fields[1].annotated,
+        "OutputReference.output_index",
+    );
+    assert!(
+        matches!(
+            expect_data_schema(schema, transaction_id_ref, "OutputReference.transaction_id"),
+            Data::Bytes
+        ),
+        "transaction_id should remain a bytes field"
+    );
+    assert!(
+        matches!(
+            expect_data_schema(schema, output_index_ref, "OutputReference.output_index"),
+            Data::Integer
+        ),
+        "output_index should remain an integer field"
+    );
+}
+
+#[test]
+fn export_path_preserves_state_machine_transition_semantics() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_verify_state_machine_semantics_fixture(tmp.path());
+
+    let mut project = Project::new(tmp.path().to_path_buf(), EventTarget::default()).unwrap();
+    project.compile(Options::default()).unwrap();
+
+    let exported = project
+        .export_tests(None, false, Tracing::silent(), false)
+        .unwrap();
+    let test = exported
+        .property_tests
+        .iter()
+        .find(|t| t.name.ends_with("prop_scenario_ok_export"))
+        .expect("fixture should export property test");
+
+    assert!(
+        matches!(
+            &test.semantics,
+            FuzzerSemantics::Opaque { reason }
+                if reason.contains("not structurally understood yet")
+        ),
+        "scenario fixture should conservatively stay opaque when structural trace semantics are not provable, got {:?}",
+        test.semantics
+    );
+}
+
+#[test]
+fn export_path_preserves_opaque_semantics_for_todo_fuzzer() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_verify_export_fixture(tmp.path());
+
+    let mut project = Project::new(tmp.path().to_path_buf(), EventTarget::default()).unwrap();
+    project.compile(Options::default()).unwrap();
+
+    let exported = project
+        .export_tests(None, false, Tracing::silent(), false)
+        .unwrap();
+    let test = exported
+        .property_tests
+        .iter()
+        .find(|t| t.name.ends_with("foo_mint_roundtrip"))
+        .expect("fixture should export property test");
+
+    assert!(
+        matches!(
+            &test.semantics,
+            FuzzerSemantics::Opaque { reason }
+            if reason.contains("not structurally understood yet")
+        ),
+        "todo-based fuzzers should remain opaque in exported semantics, got {:?}",
+        test.semantics
     );
 }
 
@@ -4012,7 +5372,7 @@ fn export_path_populates_validator_metadata_for_cross_module_module_select_calls
     );
 
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             test,
             ExistentialMode::default(),
             &VerificationTargetKind::ValidatorHandler,
@@ -4021,7 +5381,7 @@ fn export_path_populates_validator_metadata_for_cross_module_module_select_calls
         "validator target preflight should succeed for cross-module fixture"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             test,
             ExistentialMode::default(),
             &VerificationTargetKind::Equivalence,
@@ -4065,7 +5425,7 @@ fn export_path_populates_validator_metadata_via_helper_functions() {
         "helper-routed validator tests should keep compiled handler program"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             test,
             ExistentialMode::default(),
             &VerificationTargetKind::ValidatorHandler,
@@ -4074,7 +5434,7 @@ fn export_path_populates_validator_metadata_via_helper_functions() {
         "validator target preflight should succeed for helper-routed fixture"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             test,
             ExistentialMode::default(),
             &VerificationTargetKind::Equivalence,
@@ -4118,7 +5478,7 @@ fn export_path_populates_validator_metadata_via_local_alias_arguments() {
         "local-alias-routed validator tests should keep compiled handler program"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             test,
             ExistentialMode::default(),
             &VerificationTargetKind::ValidatorHandler,
@@ -4127,7 +5487,7 @@ fn export_path_populates_validator_metadata_via_local_alias_arguments() {
         "validator target preflight should succeed for local-alias-routed fixture"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             test,
             ExistentialMode::default(),
             &VerificationTargetKind::Equivalence,
@@ -4171,7 +5531,7 @@ fn export_path_populates_validator_metadata_via_local_callee_aliases() {
         "local-callee-alias-routed validator tests should keep compiled handler program"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             test,
             ExistentialMode::default(),
             &VerificationTargetKind::ValidatorHandler,
@@ -4180,7 +5540,7 @@ fn export_path_populates_validator_metadata_via_local_callee_aliases() {
         "validator target preflight should succeed for local-callee-alias-routed fixture"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             test,
             ExistentialMode::default(),
             &VerificationTargetKind::Equivalence,
@@ -4224,7 +5584,7 @@ fn export_path_populates_validator_metadata_via_tuple_destructured_assignments()
         "tuple-destructuring-routed validator tests should keep compiled handler program"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             test,
             ExistentialMode::default(),
             &VerificationTargetKind::ValidatorHandler,
@@ -4233,7 +5593,7 @@ fn export_path_populates_validator_metadata_via_tuple_destructured_assignments()
         "validator target preflight should succeed for tuple-destructuring-routed fixture"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             test,
             ExistentialMode::default(),
             &VerificationTargetKind::Equivalence,
@@ -4369,7 +5729,7 @@ fn export_path_populates_validator_metadata_for_when_and_if_is_shadowed_argument
     );
 
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             when_shadowed,
             ExistentialMode::default(),
             &VerificationTargetKind::ValidatorHandler,
@@ -4378,7 +5738,7 @@ fn export_path_populates_validator_metadata_for_when_and_if_is_shadowed_argument
         "validator target preflight should succeed for when-shadowed argument fixture"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             when_shadowed,
             ExistentialMode::default(),
             &VerificationTargetKind::Equivalence,
@@ -4387,7 +5747,7 @@ fn export_path_populates_validator_metadata_for_when_and_if_is_shadowed_argument
         "equivalence target preflight should succeed for when-shadowed argument fixture"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             if_is_shadowed,
             ExistentialMode::default(),
             &VerificationTargetKind::ValidatorHandler,
@@ -4396,7 +5756,7 @@ fn export_path_populates_validator_metadata_for_when_and_if_is_shadowed_argument
         "validator target preflight should succeed for if-is-shadowed argument fixture"
     );
     assert!(
-        preflight_validate_test(
+        preflight_validate_test_with_force_sampled_fallback(
             if_is_shadowed,
             ExistentialMode::default(),
             &VerificationTargetKind::Equivalence,
@@ -4539,10 +5899,14 @@ fn export_tests_output_generates_validator_and_equivalence_workspaces() {
             target: target.clone(),
         };
 
-        let manifest = generate_lean_workspace(&validator_target_tests, &config, false)
-            .unwrap_or_else(|e| {
-                panic!("workspace generation should succeed for --target {target}: {e}")
-            });
+        let manifest = generate_lean_workspace_with_force_sampled_fallback(
+            &validator_target_tests,
+            &config,
+            false,
+        )
+        .unwrap_or_else(|e| {
+            panic!("workspace generation should succeed for --target {target}: {e}")
+        });
 
         assert_eq!(manifest.tests.len(), 1);
 
@@ -4780,7 +6144,7 @@ fn equivalence_target_fallback_uses_non_vacuous_void_error_goal() {
     let lean_name = sanitize_lean_name("test_eq_void_fallback");
     let lean_module = "AikenVerify.Proofs.My_module.test_eq_void_fallback";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -4832,7 +6196,7 @@ fn equivalence_target_fallback_stays_universal_in_fail_once_mode() {
     let lean_name = sanitize_lean_name("test_eq_fallback_fail_once");
     let lean_module = "AikenVerify.Proofs.My_module.test_eq_fallback_fail_once";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -5212,7 +6576,8 @@ fn skip_unsupported_collects_skipped_tests() {
     ]);
     unsupported.constraint = FuzzerConstraint::Any;
 
-    let manifest = generate_lean_workspace(&[unsupported], &config, true).unwrap();
+    let manifest =
+        generate_lean_workspace_with_force_sampled_fallback(&[unsupported], &config, true).unwrap();
     assert_eq!(manifest.tests.len(), 1);
     assert!(manifest.skipped.is_empty());
 }
@@ -5312,7 +6677,8 @@ fn skip_unsupported_false_errors_on_unsupported() {
     ]);
     unsupported.constraint = FuzzerConstraint::Any;
 
-    let result = generate_lean_workspace(&[unsupported], &config, false);
+    let result =
+        generate_lean_workspace_with_force_sampled_fallback(&[unsupported], &config, false);
     assert!(
         result.is_ok(),
         "Nested composites should generate via fallback even without skip mode"
@@ -5372,7 +6738,8 @@ fn skip_unsupported_mixed_generates_supported_and_skips_rest() {
     ]);
     bad.constraint = FuzzerConstraint::Any;
 
-    let manifest = generate_lean_workspace(&[good, bad], &config, true).unwrap();
+    let manifest =
+        generate_lean_workspace_with_force_sampled_fallback(&[good, bad], &config, true).unwrap();
     assert_eq!(manifest.tests.len(), 2, "Both tests should generate");
     assert!(manifest.skipped.is_empty(), "No tests should be skipped");
 }
@@ -5391,7 +6758,7 @@ fn string_without_domain_predicate_uses_sampled_domain_fallback() {
     let lean_name = sanitize_lean_name("test_string");
     let lean_module = "AikenVerify.Proofs.My_module.test_string";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -5420,7 +6787,7 @@ fn pair_data_data_without_predicates_uses_fallback() {
     let lean_name = sanitize_lean_name("test_pair_dd");
     let lean_module = "AikenVerify.Proofs.My_module.test_pair_dd";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -5547,7 +6914,7 @@ fn tuple_arity_5_all_data_without_predicates_uses_fallback() {
     let lean_name = sanitize_lean_name("test_quint");
     let lean_module = "AikenVerify.Proofs.My_module.test_quint";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -5572,7 +6939,7 @@ fn tuple_high_arity_without_predicates_uses_fallback() {
     let lean_name = sanitize_lean_name("test_arity_20");
     let lean_module = "AikenVerify.Proofs.My_module.test_arity_20";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -5798,7 +7165,7 @@ fn unsupported_type_uses_sampled_domain_fallback() {
     let lean_name = sanitize_lean_name("test_adt");
     let lean_module = "AikenVerify.Proofs.My_module.test_adt";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,
@@ -6277,6 +7644,11 @@ fn compat_all_supported_scalar_types_generate_workspace() {
         let mut test = make_test("compat", &format!("scalar_{i}"));
         test.fuzzer_output_type = output_type.clone();
         test.constraint = constraint.clone();
+        test.semantics = derive_fixture_semantics_from_constraint(
+            &test.fuzzer_output_type,
+            &test.constraint,
+            false,
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let config = VerifyConfig {
@@ -6287,7 +7659,7 @@ fn compat_all_supported_scalar_types_generate_workspace() {
             target: VerificationTargetKind::PropertyWrapper,
         };
 
-        let manifest = generate_lean_workspace(&[test], &config, false);
+        let manifest = generate_lean_workspace_with_force_sampled_fallback(&[test], &config, false);
         assert!(
             manifest.is_ok(),
             "Scalar type {:?} should generate workspace",
@@ -6326,6 +7698,11 @@ fn compat_tuple_and_list_types_generate_workspace() {
         let mut test = make_test("compat", label);
         test.fuzzer_output_type = output_type.clone();
         test.constraint = constraint.clone();
+        test.semantics = derive_fixture_semantics_from_constraint(
+            &test.fuzzer_output_type,
+            &test.constraint,
+            false,
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let config = VerifyConfig {
@@ -6353,6 +7730,8 @@ fn compat_unsupported_type_fails_without_skip() {
         FuzzerOutputType::Data,
     ]);
     test.constraint = FuzzerConstraint::Any;
+    test.semantics =
+        derive_fixture_semantics_from_constraint(&test.fuzzer_output_type, &test.constraint, false);
 
     let dir = tempfile::tempdir().unwrap();
     let config = VerifyConfig {
@@ -6363,7 +7742,7 @@ fn compat_unsupported_type_fails_without_skip() {
         target: VerificationTargetKind::PropertyWrapper,
     };
 
-    let result = generate_lean_workspace(&[test], &config, false);
+    let result = generate_lean_workspace_with_force_sampled_fallback(&[test], &config, false);
     assert!(
         result.is_ok(),
         "Nested composites should now generate via sampled-domain fallback"
@@ -6378,6 +7757,8 @@ fn compat_unsupported_type_skipped_with_flag() {
         FuzzerOutputType::Data,
     ]);
     test.constraint = FuzzerConstraint::Any;
+    test.semantics =
+        derive_fixture_semantics_from_constraint(&test.fuzzer_output_type, &test.constraint, false);
 
     let dir = tempfile::tempdir().unwrap();
     let config = VerifyConfig {
@@ -6388,7 +7769,8 @@ fn compat_unsupported_type_skipped_with_flag() {
         target: VerificationTargetKind::PropertyWrapper,
     };
 
-    let manifest = generate_lean_workspace(&[test], &config, true).unwrap();
+    let manifest =
+        generate_lean_workspace_with_force_sampled_fallback(&[test], &config, true).unwrap();
     assert_eq!(manifest.tests.len(), 1);
     assert!(manifest.skipped.is_empty());
 }
@@ -6402,6 +7784,8 @@ fn compat_fail_once_witness_mode_generates_existential() {
     );
     test.fuzzer_output_type = FuzzerOutputType::Data;
     test.constraint = FuzzerConstraint::Any;
+    test.semantics =
+        derive_fixture_semantics_from_constraint(&test.fuzzer_output_type, &test.constraint, false);
 
     let dir = tempfile::tempdir().unwrap();
     let config = VerifyConfig {
@@ -6412,7 +7796,8 @@ fn compat_fail_once_witness_mode_generates_existential() {
         target: VerificationTargetKind::PropertyWrapper,
     };
 
-    let manifest = generate_lean_workspace(&[test], &config, false).unwrap();
+    let manifest =
+        generate_lean_workspace_with_force_sampled_fallback(&[test], &config, false).unwrap();
     assert_eq!(manifest.tests.len(), 1);
 
     // Read the generated proof file to verify existential theorem
@@ -6430,6 +7815,8 @@ fn compat_void_return_mode_generates_halt_theorem() {
     test.return_mode = TestReturnMode::Void;
     test.fuzzer_output_type = FuzzerOutputType::Data;
     test.constraint = FuzzerConstraint::Any;
+    test.semantics =
+        derive_fixture_semantics_from_constraint(&test.fuzzer_output_type, &test.constraint, false);
 
     let dir = tempfile::tempdir().unwrap();
     let config = VerifyConfig {
@@ -6440,7 +7827,8 @@ fn compat_void_return_mode_generates_halt_theorem() {
         target: VerificationTargetKind::PropertyWrapper,
     };
 
-    let manifest = generate_lean_workspace(&[test], &config, false).unwrap();
+    let manifest =
+        generate_lean_workspace_with_force_sampled_fallback(&[test], &config, false).unwrap();
     assert_eq!(manifest.tests.len(), 1);
 
     let proof_path = dir.path().join(&manifest.tests[0].lean_file);
@@ -6448,6 +7836,265 @@ fn compat_void_return_mode_generates_halt_theorem() {
     assert!(
         content.contains("proveTestsHalt"),
         "Void-returning test should use proveTestsHalt"
+    );
+}
+
+#[test]
+fn phase12_benchmark_matrix_collects_fidelity_and_tractability_evidence() {
+    let scalar_bounds = make_test_with_type(
+        "phase12",
+        "scalar_bounds",
+        FuzzerOutputType::Int,
+        FuzzerConstraint::IntRange {
+            min: "0".to_string(),
+            max: "10".to_string(),
+        },
+    );
+    let bounded_collection = make_test_with_type(
+        "phase12",
+        "bounded_collection",
+        FuzzerOutputType::List(Box::new(FuzzerOutputType::Int)),
+        FuzzerConstraint::List {
+            elem: Box::new(FuzzerConstraint::IntRange {
+                min: "0".to_string(),
+                max: "3".to_string(),
+            }),
+            min_len: Some(1),
+            max_len: Some(4),
+        },
+    );
+    let constructor_domain = make_test_with_type(
+        "phase12",
+        "constructor_domain",
+        FuzzerOutputType::Data,
+        FuzzerConstraint::DataConstructorTags {
+            tags: vec![0, 1, 2],
+        },
+    );
+    let mut mapped_projected = make_test_with_type(
+        "phase12",
+        "mapped_projected_domain",
+        FuzzerOutputType::Int,
+        FuzzerConstraint::Map(Box::new(FuzzerConstraint::IntRange {
+            min: "0".to_string(),
+            max: "10".to_string(),
+        })),
+    );
+    mapped_projected.semantics = FuzzerSemantics::IntRange {
+        min: Some("100".to_string()),
+        max: Some("110".to_string()),
+    };
+
+    let renamed_wrapper_a = make_test_with_type(
+        "phase12.helpers",
+        "wrap_alpha_case",
+        FuzzerOutputType::Int,
+        FuzzerConstraint::IntRange {
+            min: "0".to_string(),
+            max: "10".to_string(),
+        },
+    );
+    let renamed_wrapper_b = make_test_with_type(
+        "phase12.helpers",
+        "wrap_bravo_case",
+        FuzzerOutputType::Int,
+        FuzzerConstraint::IntRange {
+            min: "0".to_string(),
+            max: "10".to_string(),
+        },
+    );
+
+    let reduced_state_machine_trace = make_phase12_state_machine_test(
+        "phase12_reduced_trace_ok",
+        StateMachineAcceptance::AcceptsSuccess,
+    );
+    let amaru_permissions_property = make_phase12_state_machine_test(
+        "prop_permissions_core_development_standard_ko",
+        StateMachineAcceptance::AcceptsFailure,
+    );
+
+    let mut total_direct_bytes = 0usize;
+    let mut total_fallback_bytes = 0usize;
+    let mut renamed_metrics = Vec::new();
+    let mut state_machine_metrics = Vec::new();
+
+    let cases = vec![
+        ("scalar_bounds", scalar_bounds.clone()),
+        ("bounded_collection", bounded_collection.clone()),
+        ("constructor_domain", constructor_domain.clone()),
+        ("mapped_projected", mapped_projected.clone()),
+        ("renamed_wrapper_a", renamed_wrapper_a.clone()),
+        ("renamed_wrapper_b", renamed_wrapper_b.clone()),
+        (
+            "reduced_state_machine_trace",
+            reduced_state_machine_trace.clone(),
+        ),
+        (
+            "amaru_permissions_property",
+            amaru_permissions_property.clone(),
+        ),
+    ];
+
+    for (label, test) in &cases {
+        let direct = generate_proof_for_phase12_case(test, false)
+            .unwrap_or_else(|e| panic!("direct proof should generate for {label}: {e}"));
+        let direct_metrics = collect_proof_benchmark_metrics(&direct);
+        assert!(
+            !direct_metrics.sampled_fallback,
+            "direct semantic lowering should avoid sampled fallback for {label}, got:\n{direct}"
+        );
+        assert!(
+            direct_metrics.theorem_size_bytes > 0 && direct_metrics.theorem_count >= 1,
+            "proof metrics should be non-empty for {label}, got: {direct_metrics:?}"
+        );
+        assert!(
+            direct_metrics.theorem_size_bytes < 120_000,
+            "theorem size budget exceeded for {label}: {:?}",
+            direct_metrics
+        );
+        assert!(
+            direct_metrics.helper_count < 400,
+            "helper-definition budget exceeded for {label}: {:?}",
+            direct_metrics
+        );
+
+        let fallback = generate_proof_for_phase12_case(test, true)
+            .unwrap_or_else(|e| panic!("fallback proof should generate for {label}: {e}"));
+        let fallback_metrics = collect_proof_benchmark_metrics(&fallback);
+        assert!(
+            fallback_metrics.sampled_fallback,
+            "forced sampled fallback should use sampled theorem path for {label}, got:\n{fallback}"
+        );
+        assert!(
+            direct_metrics.theorem_size_bytes != fallback_metrics.theorem_size_bytes
+                || direct_metrics.helper_count != fallback_metrics.helper_count,
+            "exact/fallback delta should be observable for {label}; direct={direct_metrics:?}, fallback={fallback_metrics:?}"
+        );
+
+        total_direct_bytes += direct_metrics.theorem_size_bytes;
+        total_fallback_bytes += fallback_metrics.theorem_size_bytes;
+
+        if matches!(*label, "renamed_wrapper_a" | "renamed_wrapper_b") {
+            assert!(
+                direct.contains("(0 <= x && x <= 10)"),
+                "renamed/wrapped helper invariance should preserve semantic bounds for {label}, got:\n{direct}"
+            );
+            renamed_metrics.push(direct_metrics.clone());
+        }
+
+        if matches!(
+            *label,
+            "reduced_state_machine_trace" | "amaru_permissions_property"
+        ) {
+            assert!(
+                direct_metrics.has_reachability_helpers,
+                "state-machine direct lowering should include reachability helpers for {label}, got:\n{direct}"
+            );
+            state_machine_metrics.push(direct_metrics.clone());
+        }
+    }
+
+    assert!(
+        total_direct_bytes != total_fallback_bytes,
+        "aggregate exact-vs-fallback theorem-size deltas should be observable"
+    );
+    assert_eq!(renamed_metrics.len(), 2);
+    assert_eq!(
+        renamed_metrics[0].helper_count, renamed_metrics[1].helper_count,
+        "renamed/wrapped helper cases should preserve helper complexity"
+    );
+    assert_eq!(state_machine_metrics.len(), 2);
+    assert_ne!(
+        state_machine_metrics[0].theorem_size_bytes, state_machine_metrics[1].theorem_size_bytes,
+        "acceptance-specific state-machine encodings should have observable size differences"
+    );
+
+    let mut widened_semantics = make_test_with_type(
+        "phase12",
+        "widened_semantics_case",
+        FuzzerOutputType::Int,
+        FuzzerConstraint::IntRange {
+            min: "0".to_string(),
+            max: "10".to_string(),
+        },
+    );
+    widened_semantics.semantics = FuzzerSemantics::Opaque {
+        reason: "phase12 widened-domain benchmark fixture".to_string(),
+    };
+    let widened_err = generate_proof_for_phase12_case(&widened_semantics, false)
+        .expect_err("widened semantic domains should require sampled fallback");
+    let widened_message = widened_err.to_string();
+    assert!(
+        widened_message
+            .contains("requires explicit sampled-domain mode (--force-sampled-fallback)"),
+        "widened semantic domains should fail closed without explicit fallback mode, got: {widened_message}"
+    );
+    let widened_fallback = generate_proof_for_phase12_case(&widened_semantics, true)
+        .expect("explicit sampled fallback should remain available for widened domains");
+    assert!(
+        collect_proof_benchmark_metrics(&widened_fallback).sampled_fallback,
+        "widened domains in explicit mode should emit sampled fallback theorems"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = VerifyConfig {
+        out_dir: dir.path().to_path_buf(),
+        cek_budget: 20_000,
+        blaster_rev: DEFAULT_BLASTER_REV.to_string(),
+        existential_mode: ExistentialMode::Witness,
+        target: VerificationTargetKind::PropertyWrapper,
+    };
+    let manifest = generate_lean_workspace(
+        &[
+            scalar_bounds,
+            bounded_collection,
+            constructor_domain,
+            mapped_projected,
+            reduced_state_machine_trace,
+        ],
+        &config,
+        false,
+    )
+    .expect("phase12 benchmark manifest generation should succeed");
+
+    let success_summary = parse_verify_results(
+        VerifyResult {
+            success: true,
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            theorem_results: None,
+        },
+        &manifest,
+    );
+    let solve_rate = if success_summary.total == 0 {
+        0.0
+    } else {
+        success_summary.proved as f64 / success_summary.total as f64
+    };
+    assert_eq!(
+        solve_rate, 1.0,
+        "synthetic success run should have 100% solve rate"
+    );
+
+    let timeout_summary = parse_verify_results(
+        VerifyResult {
+            success: false,
+            stdout: String::new(),
+            stderr: "[verify-timeout] deterministic timeout reached".to_string(),
+            exit_code: Some(1),
+            theorem_results: None,
+        },
+        &manifest,
+    );
+    let timeout_rate = if timeout_summary.total == 0 {
+        0.0
+    } else {
+        timeout_summary.timed_out as f64 / timeout_summary.total as f64
+    };
+    assert!(
+        timeout_rate > 0.0,
+        "timeout benchmark run should report non-zero timeout rate"
     );
 }
 
@@ -6484,11 +8131,11 @@ fn intentional_limitations_register() {
     //    automatic multi-arg decomposition to tuple fuzzers.
     assert_eq!(caps.max_test_arity, 1);
 
-    // 4. Nested composite types are supported via sampled-domain fallback.
+    // 4. Nested composite types require explicit sampled-domain mode when direct lowering is unavailable.
     assert!(
         caps.supported_fuzzer_types
             .iter()
-            .any(|t| t.contains("sampled-domain fallback"))
+            .any(|t| t.contains("--force-sampled-fallback"))
     );
 
     // 5. Blaster translation gaps are documented explicitly so failures can
@@ -6638,7 +8285,7 @@ fn list_bool_with_mapped_int_range_uses_sampled_domain_fallback() {
     let lean_name = sanitize_lean_name("test_list_bool");
     let lean_module = "AikenVerify.Proofs.My_module.test_list_bool";
 
-    let proof = generate_proof_file(
+    let proof = generate_proof_file_with_force_sampled_fallback(
         &test,
         &id,
         &lean_name,

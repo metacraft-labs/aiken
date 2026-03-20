@@ -772,8 +772,8 @@ fn exec_run_with_project(
     }
 
     // When --generate-only, run theorem-shape preflight before file generation work.
-    // This uses the same proof generator path (including sampled-domain fallback),
-    // so fallback-capable tests are accepted here.
+    // This uses the same proof generator path and rejects implicit sampled fallback.
+    // Use --force-sampled-fallback to opt into flat-fuzzer sampled mode explicitly.
     if run_options.generate_only && !run_options.skip_unsupported {
         let unsupported = collect_generate_only_preflight_errors(
             property_tests,
@@ -789,7 +789,8 @@ fn exec_run_with_project(
                     format!(
                         "Cannot generate Lean workspace:\n\n\
                          The following property tests have unsupported theorem/constraint shapes:\n  - {}\n\n\
-                         Hint: use --skip-unsupported to skip unsupported tests.",
+                         Hint: use --force-sampled-fallback to opt into explicit sampled-domain mode,\n\
+                         or --skip-unsupported to skip unsupported tests.",
                         unsupported.join("\n  - ")
                     ),
                 ),
@@ -1267,7 +1268,9 @@ mod tests {
     use aiken_lang::ast::OnTestFailure;
     use aiken_project::{
         Project,
-        export::{ExportedProgram, FuzzerConstraint, FuzzerOutputType, TestReturnMode},
+        export::{
+            ExportedProgram, FuzzerConstraint, FuzzerOutputType, FuzzerSemantics, TestReturnMode,
+        },
         telemetry::EventTarget,
     };
     use clap::Parser;
@@ -1303,6 +1306,10 @@ mod tests {
             fuzzer_type: "Int".to_string(),
             fuzzer_output_type,
             constraint,
+            semantics: FuzzerSemantics::Opaque {
+                reason: "test fixture semantics not set".to_string(),
+            },
+            fuzzer_data_schema: None,
         }
     }
 

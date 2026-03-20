@@ -159,6 +159,81 @@ pub enum FuzzerConstraint {
     Unsupported { reason: String },
 }
 
+#[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
+pub enum FuzzerSemantics {
+    Bool,
+    IntRange {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max: Option<String>,
+    },
+    ByteArrayRange {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min_len: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_len: Option<usize>,
+    },
+    String,
+    Data,
+    Exact(FuzzerExactValue),
+    Product(Vec<FuzzerSemantics>),
+    List {
+        element: Box<FuzzerSemantics>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min_len: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_len: Option<usize>,
+    },
+    Constructors {
+        tags: Vec<u64>,
+    },
+    StateMachineTrace {
+        acceptance: StateMachineAcceptance,
+        state_type: FuzzerOutputType,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
+        step_input_types: Vec<FuzzerOutputType>,
+        label_type: FuzzerOutputType,
+        event_type: FuzzerOutputType,
+        transition_semantics: StateMachineTransitionSemantics,
+        output_semantics: Box<FuzzerSemantics>,
+    },
+    Opaque {
+        reason: String,
+    },
+}
+
+#[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
+pub enum StateMachineAcceptance {
+    AcceptsSuccess,
+    AcceptsFailure,
+}
+
+#[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StateMachineTransitionSemantics {
+    pub terminal_tag: u64,
+    pub step_tag: u64,
+    pub label_field_index: usize,
+    pub next_state_field_index: usize,
+    pub event_field_index: usize,
+    pub state_semantics: Box<FuzzerSemantics>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub step_input_semantics: Vec<FuzzerSemantics>,
+    pub label_semantics: Box<FuzzerSemantics>,
+    pub event_semantics: Box<FuzzerSemantics>,
+}
+
+#[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExportedDataSchema {
+    pub root: crate::blueprint::definitions::Reference,
+
+    #[serde(skip_serializing_if = "Definitions::is_empty")]
+    #[serde(default)]
+    pub definitions: Definitions<Annotated<Schema>>,
+}
+
 /// Whether a property test returns Bool or Void.
 ///
 /// Bool-returning tests are verified via `proveTests` (Option Bool) with `= true`/`= false`.
@@ -243,6 +318,10 @@ pub struct ExportedPropertyTest {
     pub fuzzer_type: String,
     pub fuzzer_output_type: FuzzerOutputType,
     pub constraint: FuzzerConstraint,
+    pub semantics: FuzzerSemantics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub fuzzer_data_schema: Option<ExportedDataSchema>,
 }
 
 #[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]

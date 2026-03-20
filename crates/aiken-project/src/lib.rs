@@ -23,6 +23,7 @@ mod tests;
 use crate::{
     blueprint::{
         Blueprint,
+        definitions::Definitions,
         schema::{Annotated, Schema},
     },
     config::ProjectConfig,
@@ -42,14 +43,18 @@ use aiken_lang::{
     gen_uplc::CodeGenerator,
     line_numbers::LineNumbers,
     test_framework::{
-        FuzzerConstraint as LangFuzzerConstraint, PropertyTest, RunnableKind, Test, TestResult,
+        FuzzerConstraint as LangFuzzerConstraint, FuzzerSemantics as LangFuzzerSemantics,
+        PropertyTest, RunnableKind, SemanticType as LangSemanticType,
+        StateMachineAcceptance as LangStateMachineAcceptance,
+        StateMachineTransitionSemantics as LangStateMachineTransitionSemantics, Test, TestResult,
     },
     tipo::{self, ModuleValueConstructor, Type, TypeInfo, ValueConstructorVariant},
     utils,
 };
 use export::{
-    Export, ExportedProgram, ExportedPropertyTest, ExportedTests, FuzzerConstraint,
-    FuzzerExactValue, TestReturnMode, ValidatorTarget, VerificationTargetKind,
+    Export, ExportedDataSchema, ExportedProgram, ExportedPropertyTest, ExportedTests,
+    FuzzerConstraint, FuzzerExactValue, FuzzerSemantics, StateMachineAcceptance,
+    StateMachineTransitionSemantics, TestReturnMode, ValidatorTarget, VerificationTargetKind,
     fuzzer_output_type_from,
 };
 use indexmap::IndexMap;
@@ -72,6 +77,18 @@ use uplc::{
 };
 
 /// Convert a `FuzzerConstraint` from the lang crate to the export crate's version.
+fn convert_exact_value(value: &aiken_lang::test_framework::FuzzerExactValue) -> FuzzerExactValue {
+    match value {
+        aiken_lang::test_framework::FuzzerExactValue::Bool(v) => FuzzerExactValue::Bool(*v),
+        aiken_lang::test_framework::FuzzerExactValue::ByteArray(bytes) => {
+            FuzzerExactValue::ByteArray(bytes.clone())
+        }
+        aiken_lang::test_framework::FuzzerExactValue::String(s) => {
+            FuzzerExactValue::String(s.clone())
+        }
+    }
+}
+
 fn convert_constraint(lang: &LangFuzzerConstraint) -> FuzzerConstraint {
     match lang {
         LangFuzzerConstraint::Any => FuzzerConstraint::Any,
@@ -85,15 +102,7 @@ fn convert_constraint(lang: &LangFuzzerConstraint) -> FuzzerConstraint {
                 max_len: *max_len,
             }
         }
-        LangFuzzerConstraint::Exact(value) => FuzzerConstraint::Exact(match value {
-            aiken_lang::test_framework::FuzzerExactValue::Bool(v) => FuzzerExactValue::Bool(*v),
-            aiken_lang::test_framework::FuzzerExactValue::ByteArray(bytes) => {
-                FuzzerExactValue::ByteArray(bytes.clone())
-            }
-            aiken_lang::test_framework::FuzzerExactValue::String(s) => {
-                FuzzerExactValue::String(s.clone())
-            }
-        }),
+        LangFuzzerConstraint::Exact(value) => FuzzerConstraint::Exact(convert_exact_value(value)),
         LangFuzzerConstraint::Tuple(elems) => {
             FuzzerConstraint::Tuple(elems.iter().map(convert_constraint).collect())
         }
@@ -119,6 +128,114 @@ fn convert_constraint(lang: &LangFuzzerConstraint) -> FuzzerConstraint {
             reason: reason.clone(),
         },
     }
+}
+
+fn convert_semantic_type(lang: &LangSemanticType) -> export::FuzzerOutputType {
+    match lang {
+        LangSemanticType::Int => export::FuzzerOutputType::Int,
+        LangSemanticType::Bool => export::FuzzerOutputType::Bool,
+        LangSemanticType::ByteArray => export::FuzzerOutputType::ByteArray,
+        LangSemanticType::String => export::FuzzerOutputType::String,
+        LangSemanticType::Data => export::FuzzerOutputType::Data,
+        LangSemanticType::List(inner) => {
+            export::FuzzerOutputType::List(Box::new(convert_semantic_type(inner)))
+        }
+        LangSemanticType::Tuple(elems) => {
+            export::FuzzerOutputType::Tuple(elems.iter().map(convert_semantic_type).collect())
+        }
+        LangSemanticType::Pair(fst, snd) => export::FuzzerOutputType::Pair(
+            Box::new(convert_semantic_type(fst)),
+            Box::new(convert_semantic_type(snd)),
+        ),
+        LangSemanticType::Unsupported(name) => export::FuzzerOutputType::Unsupported(name.clone()),
+    }
+}
+
+fn convert_state_machine_acceptance(lang: &LangStateMachineAcceptance) -> StateMachineAcceptance {
+    match lang {
+        LangStateMachineAcceptance::AcceptsSuccess => StateMachineAcceptance::AcceptsSuccess,
+        LangStateMachineAcceptance::AcceptsFailure => StateMachineAcceptance::AcceptsFailure,
+    }
+}
+
+fn convert_state_machine_transition_semantics(
+    lang: &LangStateMachineTransitionSemantics,
+) -> StateMachineTransitionSemantics {
+    StateMachineTransitionSemantics {
+        terminal_tag: lang.terminal_tag,
+        step_tag: lang.step_tag,
+        label_field_index: lang.label_field_index,
+        next_state_field_index: lang.next_state_field_index,
+        event_field_index: lang.event_field_index,
+        state_semantics: Box::new(convert_semantics(lang.state_semantics.as_ref())),
+        step_input_semantics: lang
+            .step_input_semantics
+            .iter()
+            .map(convert_semantics)
+            .collect(),
+        label_semantics: Box::new(convert_semantics(lang.label_semantics.as_ref())),
+        event_semantics: Box::new(convert_semantics(lang.event_semantics.as_ref())),
+    }
+}
+
+fn convert_semantics(lang: &LangFuzzerSemantics) -> FuzzerSemantics {
+    match lang {
+        LangFuzzerSemantics::Bool => FuzzerSemantics::Bool,
+        LangFuzzerSemantics::IntRange { min, max } => FuzzerSemantics::IntRange {
+            min: min.clone(),
+            max: max.clone(),
+        },
+        LangFuzzerSemantics::ByteArrayRange { min_len, max_len } => {
+            FuzzerSemantics::ByteArrayRange {
+                min_len: *min_len,
+                max_len: *max_len,
+            }
+        }
+        LangFuzzerSemantics::String => FuzzerSemantics::String,
+        LangFuzzerSemantics::Data => FuzzerSemantics::Data,
+        LangFuzzerSemantics::Exact(value) => FuzzerSemantics::Exact(convert_exact_value(value)),
+        LangFuzzerSemantics::Product(elems) => {
+            FuzzerSemantics::Product(elems.iter().map(convert_semantics).collect())
+        }
+        LangFuzzerSemantics::List {
+            element,
+            min_len,
+            max_len,
+        } => FuzzerSemantics::List {
+            element: Box::new(convert_semantics(element)),
+            min_len: *min_len,
+            max_len: *max_len,
+        },
+        LangFuzzerSemantics::Constructors { tags } => {
+            FuzzerSemantics::Constructors { tags: tags.clone() }
+        }
+        LangFuzzerSemantics::StateMachineTrace {
+            acceptance,
+            state_type,
+            step_input_types,
+            label_type,
+            event_type,
+            transition_semantics,
+            output_semantics,
+        } => FuzzerSemantics::StateMachineTrace {
+            acceptance: convert_state_machine_acceptance(acceptance),
+            state_type: convert_semantic_type(state_type),
+            step_input_types: step_input_types.iter().map(convert_semantic_type).collect(),
+            label_type: convert_semantic_type(label_type),
+            event_type: convert_semantic_type(event_type),
+            transition_semantics: convert_state_machine_transition_semantics(transition_semantics),
+            output_semantics: Box::new(convert_semantics(output_semantics)),
+        },
+        LangFuzzerSemantics::Opaque { reason } => FuzzerSemantics::Opaque {
+            reason: reason.clone(),
+        },
+    }
+}
+
+fn export_data_schema(modules: &CheckedModules, tipo: &Type) -> Option<ExportedDataSchema> {
+    let mut definitions = Definitions::new();
+    let root = Annotated::from_type(modules.into(), tipo, &mut definitions).ok()?;
+    Some(ExportedDataSchema { root, definitions })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1954,6 +2071,9 @@ where
         let fuzzer_output_type = fuzzer_output_type_from(&test.fuzzer.stripped_type_info);
 
         let constraint = convert_constraint(&test.fuzzer.constraint);
+        let semantics = convert_semantics(&test.fuzzer.semantics);
+        let fuzzer_data_schema =
+            export_data_schema(&self.checked_modules, &test.fuzzer.stripped_type_info);
 
         let return_mode = if test.return_type.is_void() {
             TestReturnMode::Void
@@ -1985,6 +2105,8 @@ where
             fuzzer_type,
             fuzzer_output_type,
             constraint,
+            semantics,
+            fuzzer_data_schema,
         })
     }
 
