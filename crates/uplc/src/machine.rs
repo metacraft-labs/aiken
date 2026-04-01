@@ -19,14 +19,16 @@ use self::{
     value::{Env, Value},
 };
 
-enum MachineState {
+pub use value::Env as MachineEnv;
+
+pub enum MachineState {
     Return(Context, Value),
     Compute(Context, Env, Term<NamedDeBruijn>),
     Done(Term<NamedDeBruijn>),
 }
 
 #[derive(Clone)]
-enum Context {
+pub enum Context {
     FrameAwaitArg(Value, Box<Context>),
     FrameAwaitFunTerm(Env, Term<NamedDeBruijn>, Box<Context>),
     FrameAwaitFunValue(Value, Box<Context>),
@@ -138,6 +140,27 @@ impl Machine {
                     return Ok(t);
                 }
             };
+        }
+    }
+
+    /// Returns the initial `MachineState` for a given term, spending the startup budget.
+    /// Use this together with `step()` to drive the CEK machine one transition at a time.
+    pub fn get_initial_machine_state(
+        &mut self,
+        term: Term<NamedDeBruijn>,
+    ) -> Result<MachineState, Error> {
+        let startup_budget = self.costs.machine_costs.get(StepKind::StartUp);
+        self.spend_budget(startup_budget)?;
+        Ok(MachineState::Compute(Context::NoFrame, Rc::new(vec![]), term))
+    }
+
+    /// Performs a single step of the CEK machine, transitioning from one `MachineState` to the next.
+    /// Returns `MachineState::Done(term)` when evaluation is complete.
+    pub fn step(&mut self, state: MachineState) -> Result<MachineState, Error> {
+        match state {
+            MachineState::Compute(context, env, t) => self.compute(context, env, t),
+            MachineState::Return(context, value) => self.return_compute(context, value),
+            done @ MachineState::Done(_) => Ok(done),
         }
     }
 

@@ -1,0 +1,62 @@
+name: Fork Tests
+
+on:
+  push:
+    branches: ["codetracer-stepping-api"]
+  pull_request:
+    branches: ["main", "codetracer-stepping-api"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit_tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-cache-tests
+      - name: Run unit tests
+        run: cargo test --verbose --workspace
+
+  acceptance_tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-cache-build
+      - name: Run examples
+        run: |
+          cargo run -r -- check examples/hello_world
+          cargo run -r -- check examples/gift_card
+          cargo run -r -- check examples/monorepo
+      - name: Run acceptance tests
+        working-directory: examples/acceptance_tests
+        run: |
+          cargo install cbor-diag-cli
+          bash ci
+        shell: bash
+
+  benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-cache-build
+      - name: Run benchmarks
+        run: cargo run -r -- check benchmarks
+
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-cache-checks
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
