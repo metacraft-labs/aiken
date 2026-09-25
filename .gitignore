@@ -5,3 +5,6 @@ _site/
 temp/
 scratch/
 .vscode/
+
+# Repro development environment cache
+.repro/
