@@ -20,6 +20,7 @@ use aiken_lang::{
 use indexmap::IndexMap;
 use std::{collections::HashMap, path::PathBuf};
 
+mod constant_folding;
 mod gen_uplc;
 
 // TODO: Possible refactor this out of the module and have it used by `Project`. The idea would
@@ -93,6 +94,14 @@ impl TestProject {
     }
 
     pub fn check(&mut self, module: ParsedModule) -> CheckedModule {
+        self.check_with_tracing(module, Tracing::All(TraceLevel::Verbose))
+    }
+
+    /// Type-check under a given tracing level. The type checker is what erases
+    /// a `trace` expression, so a test about how tracing changes the generated
+    /// program has to pass the same level here and to the code generator, the
+    /// way `aiken check` does.
+    pub fn check_with_tracing(&mut self, module: ParsedModule, tracing: Tracing) -> CheckedModule {
         let mut warnings = vec![];
 
         let ast = module
@@ -102,7 +111,7 @@ impl TestProject {
                 module.kind,
                 &self.package.to_string(),
                 &self.module_types,
-                Tracing::All(TraceLevel::Verbose),
+                tracing,
                 &mut warnings,
                 None,
             )
