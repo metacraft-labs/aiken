@@ -16,6 +16,9 @@ use strum::IntoEnumIterator;
 pub enum ScopePath {
     FUNC,
     ARG,
+    CaseScrutinee,
+    CaseBranch(usize),
+    ConstrField(usize),
 }
 
 #[derive(Eq, Hash, PartialEq, Clone, Debug, Default, PartialOrd)]
@@ -54,6 +57,23 @@ impl Scope {
 
     pub fn is_common_ancestor(&self, other: &Scope) -> bool {
         self == &self.common_ancestor(other)
+    }
+
+    fn evaluation_region(&self) -> Self {
+        // Currying may share work within a child, but must not lift it across
+        // Case/Constr children: branches are conditional and fields evaluate
+        // independently, including their errors and trace effects.
+        let boundary = self.scope.iter().rposition(|path| {
+            matches!(
+                path,
+                ScopePath::CaseScrutinee | ScopePath::CaseBranch(_) | ScopePath::ConstrField(_)
+            )
+        });
+        Self {
+            scope: boundary
+                .map(|index| self.scope[..=index].to_vec())
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -1018,7 +1038,7 @@ impl Term<Name> {
             Term::Case { constr, branches } => {
                 let constr = Rc::make_mut(constr);
                 constr.traverse_uplc_with_helper(
-                    scope,
+                    &scope.push(ScopePath::CaseScrutinee),
                     vec![],
                     id_gen,
                     with,
@@ -1026,34 +1046,25 @@ impl Term<Name> {
                     inline_lambda,
                 );
 
-                if branches.len() == 1 {
-                    // save a potentially big clone
-                    // where currently all cases will be 1 branch
-                    branches[0].traverse_uplc_with_helper(
-                        scope,
-                        arg_stack,
+                for (index, branch) in branches.iter_mut().enumerate() {
+                    // The selected branch receives the constructor's fields
+                    // before any applications surrounding Case. Those implicit
+                    // arguments have no Apply ids to remove, so optimise the
+                    // branch independently instead of consuming outer arguments.
+                    branch.traverse_uplc_with_helper(
+                        &scope.push(ScopePath::CaseBranch(index)),
+                        vec![],
                         id_gen,
                         with,
                         context,
                         inline_lambda,
                     );
-                } else {
-                    for branch in branches {
-                        branch.traverse_uplc_with_helper(
-                            scope,
-                            arg_stack.clone(),
-                            id_gen,
-                            with,
-                            context,
-                            inline_lambda,
-                        );
-                    }
                 }
             }
             Term::Constr { fields, .. } => {
-                for field in fields {
+                for (index, field) in fields.iter_mut().enumerate() {
                     field.traverse_uplc_with_helper(
-                        scope,
+                        &scope.push(ScopePath::ConstrField(index)),
                         vec![],
                         id_gen,
                         with,
@@ -1100,8 +1111,17 @@ impl Term<Name> {
             Term::Force(f) => {
                 Rc::make_mut(f).substitute_var(original, replace_with);
             }
-            Term::Case { .. } => todo!(),
-            Term::Constr { .. } => todo!(),
+            Term::Case { constr, branches } => {
+                Rc::make_mut(constr).substitute_var(original.clone(), replace_with);
+                for branch in branches {
+                    branch.substitute_var(original.clone(), replace_with);
+                }
+            }
+            Term::Constr { fields, .. } => {
+                for field in fields {
+                    field.substitute_var(original.clone(), replace_with);
+                }
+            }
             _ => (),
         }
     }
@@ -1137,8 +1157,17 @@ impl Term<Name> {
             Term::Force(f) => {
                 Rc::make_mut(f).replace_identity_usage(original.clone());
             }
-            Term::Case { .. } => todo!(),
-            Term::Constr { .. } => todo!(),
+            Term::Case { constr, branches } => {
+                Rc::make_mut(constr).replace_identity_usage(original.clone());
+                for branch in branches {
+                    branch.replace_identity_usage(original.clone());
+                }
+            }
+            Term::Constr { fields, .. } => {
+                for field in fields {
+                    field.replace_identity_usage(original.clone());
+                }
+            }
             _ => (),
         }
     }
@@ -1212,8 +1241,23 @@ impl Term<Name> {
                 force_stack.push(());
                 x.var_occurrences(search_for, arg_stack, force_stack)
             }
-            Term::Case { .. } => todo!(),
-            Term::Constr { .. } => todo!(),
+            Term::Case { constr, branches } => {
+                let occurrences = constr.var_occurrences(search_for.clone(), vec![], vec![]);
+                branches.iter().fold(occurrences, |found, branch| {
+                    // Only the selected branch executes. Treat each branch as
+                    // deferred so inlining cannot hide an eager error or trace
+                    // in an untaken branch. Case's surrounding applications and
+                    // forces do not apply to its independently evaluated children.
+                    found.combine(
+                        branch
+                            .var_occurrences(search_for.clone(), vec![], vec![])
+                            .delay_if_found(1),
+                    )
+                })
+            }
+            Term::Constr { fields, .. } => fields.iter().fold(VarLookup::new(), |found, field| {
+                found.combine(field.var_occurrences(search_for.clone(), vec![], vec![]))
+            }),
             _ => VarLookup::new(),
         }
     }
@@ -1475,8 +1519,21 @@ impl Term<Name> {
                     Rc::make_mut(term).split_body_lambda();
                     break;
                 }
-                Term::Case { .. } => todo!(),
-                Term::Constr { .. } => todo!(),
+                Term::Case { constr, branches } => {
+                    // Reorder bindings within each child, never across the
+                    // Case boundary where execution becomes conditional.
+                    Rc::make_mut(constr).split_body_lambda();
+                    for branch in branches {
+                        branch.split_body_lambda();
+                    }
+                    break;
+                }
+                Term::Constr { fields, .. } => {
+                    for field in fields {
+                        field.split_body_lambda();
+                    }
+                    break;
+                }
                 _ => break,
             }
         }
@@ -1582,8 +1639,19 @@ impl Term<Name> {
                 Term::Force(t) => {
                     term = t;
                 }
-                Term::Constr { .. } => todo!(),
-                Term::Case { .. } => todo!(),
+                Term::Constr { fields, .. } => {
+                    for field in fields {
+                        names.extend(field.get_var_names());
+                    }
+                    break;
+                }
+                Term::Case { constr, branches } => {
+                    names.extend(constr.get_var_names());
+                    for branch in branches {
+                        names.extend(branch.get_var_names());
+                    }
+                    break;
+                }
             }
         }
 
@@ -2457,7 +2525,7 @@ impl Program<Name> {
 
     // This one doesn't use the context since it's complicated and traverses the ast twice
     pub fn builtin_curry_reducer(self) -> Self {
-        let mut curried_terms = vec![];
+        let mut curried_terms: Vec<(Scope, CurriedBuiltin)> = vec![];
         let mut id_mapped_curry_terms: IndexMap<CurriedName, (Scope, Term<Name>, usize)> =
             IndexMap::new();
         let mut curry_applied_ids = vec![];
@@ -2488,13 +2556,16 @@ impl Program<Name> {
                         let builtin_args = BuiltinArgs::args_from_arg_stack(arg_stack, *func);
 
                         // First we see if we have already curried this builtin before
-                        let mut id_vec = if let Some((index, _)) =
-                            curried_terms.iter_mut().find_position(
-                                |curried_term: &&mut CurriedBuiltin| curried_term.func == *func,
-                            ) {
+                        let region = scope.evaluation_region();
+                        let mut id_vec = if let Some(index) =
+                            curried_terms
+                                .iter()
+                                .position(|(candidate_region, curried_term)| {
+                                    *candidate_region == region && curried_term.func == *func
+                                }) {
                             // We found it the builtin was curried before
                             // So now we merge the new args into the existing curried builtin
-                            let curried_builtin = curried_terms.swap_remove(index);
+                            let (_, curried_builtin) = curried_terms.swap_remove(index);
 
                             let curried_builtin =
                                 curried_builtin.merge_node_by_path(builtin_args.clone());
@@ -2506,7 +2577,7 @@ impl Program<Name> {
                                 unreachable!();
                             };
 
-                            curried_terms.push(curried_builtin);
+                            curried_terms.push((region, curried_builtin));
 
                             id_vec
                         } else {
@@ -2517,7 +2588,7 @@ impl Program<Name> {
                                 unreachable!();
                             };
 
-                            curried_terms.push(curried_builtin);
+                            curried_terms.push((region, curried_builtin));
 
                             id_vec
                         };
@@ -2600,8 +2671,11 @@ impl Program<Name> {
                             })
                             .collect_vec();
 
-                        let Some(curried_builtin) =
-                            curried_terms.iter().find(|curry| curry.func == *func)
+                        let region = scope.evaluation_region();
+                        let Some((_, curried_builtin)) =
+                            curried_terms.iter().find(|(candidate_region, curry)| {
+                                *candidate_region == region && curry.func == *func
+                            })
                         else {
                             return;
                         };
@@ -2708,7 +2782,7 @@ fn id_vec_function_to_var(func_name: &str, id_vec: &[usize]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::NO_INLINE;
+    use super::{NO_INLINE, VarLookup};
     use crate::{
         ast::{Constant, Data, Name, NamedDeBruijn, Program, Term},
         builder::{CONSTR_FIELDS_EXPOSER, CONSTR_INDEX_EXPOSER},
@@ -2737,6 +2811,119 @@ mod tests {
         let actual: Program<NamedDeBruijn> = actual.try_into().unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn case_constr_occurrences_keep_evaluation_boundaries() {
+        let term = Term::constr(
+            0,
+            vec![Term::var("x").lambda("field_arg"), Term::var("x").delay()],
+        )
+        .case(vec![Term::var("x"), Term::var("x").lambda(NO_INLINE)]);
+
+        // An application or force outside Case cannot discharge a lambda or
+        // delay inside its scrutinee's fields. Branch execution is conditional.
+        assert_eq!(
+            term.var_occurrences(Name::text("x").into(), vec![()], vec![()]),
+            VarLookup {
+                found: true,
+                occurrences: 4,
+                delays: 4,
+                no_inline: true,
+            }
+        );
+    }
+
+    #[test]
+    fn case_constr_substitution_preserves_shadowing_and_shared_terms() {
+        let original = Term::constr(0, vec![Term::var("x"), Term::var("x").lambda("x")])
+            .case(vec![Term::var("x"), Term::constr(1, vec![Term::var("x")])]);
+        let mut replaced = original.clone();
+        replaced.substitute_var(Name::text("x").into(), &Term::integer(42.into()));
+        assert_eq!(
+            replaced,
+            Term::constr(
+                0,
+                vec![Term::integer(42.into()), Term::var("x").lambda("x")]
+            )
+            .case(vec![
+                Term::integer(42.into()),
+                Term::constr(1, vec![Term::integer(42.into())])
+            ])
+        );
+        assert_eq!(
+            original,
+            Term::constr(0, vec![Term::var("x"), Term::var("x").lambda("x")])
+                .case(vec![Term::var("x"), Term::constr(1, vec![Term::var("x")])])
+        );
+    }
+
+    #[test]
+    fn case_constr_identity_replacement_preserves_shadowing() {
+        let applied = || Term::var("id").apply(Term::integer(42.into()));
+        let mut term = Term::constr(0, vec![applied(), applied().lambda("id")])
+            .case(vec![applied(), Term::constr(1, vec![applied()])]);
+        term.replace_identity_usage(Name::text("id").into());
+        assert_eq!(
+            term,
+            Term::constr(0, vec![Term::integer(42.into()), applied().lambda("id")]).case(vec![
+                Term::integer(42.into()),
+                Term::constr(1, vec![Term::integer(42.into())])
+            ])
+        );
+    }
+
+    #[test]
+    fn case_constr_dependency_names_include_every_child() {
+        let term = Term::constr(0, vec![Term::var("scrutinee")]).case(vec![
+            Term::var("branch"),
+            Term::constr(1, vec![Term::var("nested_field")]),
+        ]);
+        assert_eq!(
+            term.get_var_names(),
+            vec![
+                Name::text("scrutinee").into(),
+                Name::text("branch").into(),
+                Name::text("nested_field").into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn currying_still_shares_work_within_each_case_constr_child() {
+        let call = Term::add_integer()
+            .apply(Term::integer(1.into()))
+            .apply(Term::var("x"));
+        let body = Term::var("f")
+            .apply(call.clone())
+            .apply(call.clone())
+            .apply(call);
+        let shared_call = Term::var("shared").apply(Term::var("x"));
+        let expected_body = Term::var("f")
+            .apply(shared_call.clone())
+            .apply(shared_call.clone())
+            .apply(shared_call)
+            .lambda("shared")
+            .apply(Term::add_integer().apply(Term::integer(1.into())));
+
+        let wrappers: [fn(Term<Name>) -> Term<Name>; 3] = [
+            |term| Term::constr(0, vec![term]),
+            |term| Term::constr(0, vec![]).case(vec![term]),
+            |term| term.case(vec![Term::integer(0.into())]),
+        ];
+        for wrap in wrappers {
+            compare_optimization(
+                Program {
+                    version: (1, 1, 0),
+                    term: wrap(expected_body.clone()).lambda("x").lambda("f"),
+                },
+                Program {
+                    version: (1, 1, 0),
+                    term: wrap(body.clone()).lambda("x").lambda("f"),
+                },
+                Program::builtin_curry_reducer,
+            );
+        }
     }
 
     #[test]
